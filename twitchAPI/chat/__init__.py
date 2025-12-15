@@ -228,7 +228,7 @@ from functools import partial
 from logging import getLogger, Logger
 from time import sleep
 import aiohttp
-
+import random
 
 from twitchAPI.twitch import Twitch
 from twitchAPI.object.api import TwitchUser
@@ -866,20 +866,16 @@ class Chat:
         if self.__connection is not None and not self.__connection.closed:
             await self.__connection.close()
         retry = 0
-        need_retry = True
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=self.twitch.session_timeout)
-        while need_retry and retry < len(self.reconnect_delay_steps):
-            need_retry = False
+        while True:
             try:
                 self.__connection = await self._session.ws_connect(self.connection_url)
             except Exception:
-                self.logger.warning(f'connection attempt failed, retry in {self.reconnect_delay_steps[retry]}s...')
-                await asyncio.sleep(self.reconnect_delay_steps[retry])
                 retry += 1
-                need_retry = True
-        if retry >= len(self.reconnect_delay_steps):
-            raise TwitchBackendException('can\'t connect')
+                backoff = min(120, (2 ** retry)) + random.uniform(0, 1)
+                self.logger.warning(f'connection attempt failed, retry in {backoff:.2f}s...')
+                await asyncio.sleep(backoff)
 
     async def _keep_loop_alive(self):
         while not self._closing:
