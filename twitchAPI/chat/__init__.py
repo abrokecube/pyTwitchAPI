@@ -600,8 +600,6 @@ class Chat:
         self.no_shared_chat_messages: bool = no_shared_chat_messages
         self.listen_confirm_timeout: int = 30
         """Time in second that any :code:`listen_` should wait for its subscription to be completed."""
-        self.reconnect_delay_steps: List[int] = [0, 1, 2, 4, 8, 16, 32, 64, 128]
-        """Time in seconds between reconnect attempts"""
         self.log_no_registered_command_handler: bool = True
         """Controls if instances of commands being issued in chat where no handler exists should be logged. |default|:code:`True`"""
         self.__connection = None
@@ -871,6 +869,7 @@ class Chat:
         while True:
             try:
                 self.__connection = await self._session.ws_connect(self.connection_url)
+                break
             except Exception:
                 retry += 1
                 backoff = min(120, (2 ** retry)) + random.uniform(0, 1)
