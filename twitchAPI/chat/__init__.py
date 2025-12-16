@@ -1126,9 +1126,6 @@ class Chat:
                     t.add_done_callback(self._task_callback)
                     for _mid in self._command_middleware + self._command_specific_middleware.get(command_name, []):
                         await _mid.was_executed(command)
-            else:
-                if self.log_no_registered_command_handler:
-                    self.logger.info(f'no handler registered for command "{command_name}"')
         handler = self._event_handler.get(ChatEvent.MESSAGE, [])
         message = ChatMessage(self, parsed)
         for h in handler:
