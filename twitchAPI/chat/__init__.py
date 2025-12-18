@@ -270,7 +270,9 @@ class ChatUser:
         """The color of the chat user if set"""
         self.display_name: str = parsed['tags'].get('display-name')
         """The display name, should usually be the same as name"""
-        self.mod: bool = parsed['tags'].get('mod', '0') == '1'
+        self.lead_mod: bool = parsed['tags']['badges'].get('lead_moderator', '0') == '1'
+        """if the user is a lead moderator in chat channel"""
+        self.mod: bool = (parsed['tags'].get('mod', '0') == '1') or (self.lead_mod)
         """if the user is a mod in chat channel"""
         self.subscriber: bool = parsed['tags'].get('subscriber') == '1'
         """if the user is a subscriber to the channel"""
