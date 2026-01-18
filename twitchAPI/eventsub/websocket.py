@@ -90,6 +90,7 @@ from typing import Optional, List, Dict, Callable, Awaitable
 import aiohttp
 from aiohttp import ClientSession, WSMessage, ClientWebSocketResponse
 from collections import deque
+import random
 
 from .base import EventSubBase
 
@@ -267,20 +268,17 @@ class EventSubWebsocket(EventSubBase):
             while not self._connection.closed:
                 await asyncio.sleep(0.1)
         retry = 0
-        need_retry = True
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=self._twitch.session_timeout)
-        while need_retry and retry < len(self.reconnect_delay_steps):
-            need_retry = False
+        while True:
             try:
                 self._connection = await self._session.ws_connect(self.connection_url)
+                break
             except Exception:
-                self.logger.warning(f'connection attempt failed, retry in {self.reconnect_delay_steps[retry]} seconds...')
-                await asyncio.sleep(self.reconnect_delay_steps[retry])
                 retry += 1
-                need_retry = True
-        if retry >= len(self.reconnect_delay_steps):
-            raise TwitchBackendException(f'can\'t connect to EventSub websocket {self.connection_url}')
+                backoff = min(120, (2 ** retry)) + random.uniform(0, 5)
+                self.logger.warning(f'connection attempt failed, retry in {backoff:.2f}s...')
+                await asyncio.sleep(backoff)
 
     def _run_socket(self):
         self._socket_loop = asyncio.new_event_loop()

@@ -874,7 +874,7 @@ class Chat:
                 break
             except Exception:
                 retry += 1
-                backoff = min(120, (2 ** retry)) + random.uniform(0, 1)
+                backoff = min(120, (2 ** retry)) + random.uniform(0, 5)
                 self.logger.warning(f'connection attempt failed, retry in {backoff:.2f}s...')
                 await asyncio.sleep(backoff)
 
