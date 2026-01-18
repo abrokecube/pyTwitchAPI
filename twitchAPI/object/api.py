@@ -26,7 +26,7 @@ __all__ = ['TwitchUser', 'TwitchUserFollow', 'TwitchUserFollowResult', 'DateRang
            'StreamVacation', 'ChannelStreamSchedule', 'ChannelVIP', 'UserChatColor', 'Chatter', 'GetChattersResponse', 'ShieldModeStatus',
            'CharityAmount', 'CharityCampaign', 'CharityCampaignDonation', 'AutoModSettings', 'ChannelFollower', 'ChannelFollowersResult',
            'FollowedChannel', 'FollowedChannelsResult', 'ContentClassificationLabel', 'AdSchedule', 'AdSnoozeResponse', 'SendMessageResponse',
-           'ChannelModerator', 'UserEmotesResponse', 'WarnResponse', 'SharedChatParticipant', 'SharedChatSession']
+           'ChannelModerator', 'UserEmotesResponse', 'WarnResponse', 'SharedChatParticipant', 'SharedChatSession', 'ClipDownload']
 
 
 class TwitchUser(TwitchObject):
@@ -884,3 +884,12 @@ class SharedChatSession(TwitchObject):
     """The UTC timestamp when the session was created."""
     updated_at: datetime
     """The UTC timestamp when the session was last updated."""
+
+
+class ClipDownload(TwitchObject):
+    clip_id: str
+    """An ID that uniquely identifies the clip."""
+    landscape_download_url: Optional[str]
+    """The landscape URL to download the clip. This field is None if the URL is not available."""
+    portrait_download_url: Optional[str]
+    """The portrait URL to download the clip. This field is None if the URL is not available."""

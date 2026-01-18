@@ -612,6 +612,16 @@ class AuthScope(Enum):
     :const:`~twitchAPI.eventsub.base.EventSubBase.listen_channel_suspicious_user_message()` |br|
     :const:`~twitchAPI.eventsub.base.EventSubBase.listen_channel_suspicious_user_update()` |br|
     """
+    CHANNEL_MANAGE_CLIPS = 'channel:manage:clips'
+    """Manage Clips for a channel.
+    
+    **API** |br|
+    :const:`~twitchAPI.twitch.Twitch.get_clips_download()` |br|"""
+    EDITOR_MANAGE_CLIPS = 'editor:manage:clips'
+    """Manage Clips as an editor.
+    
+    **API** |br|
+    :const:`~twitchAPI.twitch.Twitch.get_clips_download()` |br|"""
 
 class ModerationEventType(Enum):
     """Enum of moderation event types

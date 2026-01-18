@@ -216,7 +216,7 @@ from twitchAPI.object.api import (
     CustomRewardRedemption, ChannelEditor, BlockListEntry, Poll, Prediction, RaidStartResult, ChatBadge, GetChannelEmotesResponse,
     GetEmotesResponse, GetEventSubSubscriptionResult, ChannelStreamSchedule, ChannelVIP, UserChatColor, GetChattersResponse, ShieldModeStatus,
     CharityCampaign, CharityCampaignDonation, AutoModSettings, ChannelFollowersResult, FollowedChannelsResult, ContentClassificationLabel, 
-    AdSchedule, AdSnoozeResponse, SendMessageResponse, ChannelModerator, UserEmotesResponse, WarnResponse, SharedChatSession)
+    AdSchedule, AdSnoozeResponse, SendMessageResponse, ChannelModerator, UserEmotesResponse, WarnResponse, SharedChatSession, ClipDownload)
 from twitchAPI.type import (
     AnalyticsReportType, AuthScope, TimePeriod, SortMethod, VideoType, AuthType, CustomRewardRedemptionStatus, SortOrder,
     BlockSourceContext, BlockReason, EntitlementFulfillmentStatus, PollStatus, PredictionStatus, AutoModAction,
@@ -556,12 +556,12 @@ class Twitch:
                             url_params: dict,
                             auth_type: AuthType,
                             auth_scope: List[Union[AuthScope, List[AuthScope]]],
-                            return_type: Type[Sequence[T]],
+                            return_type: Type[List[T]],
                             body_data: Optional[dict] = None,
                             split_lists: bool = False,
                             get_from_data: bool = True,
                             result_type: ResultType = ResultType.RETURN_TYPE,
-                            error_handler: Optional[Mapping[int, BaseException]] = None) -> Sequence[T]: ...
+                            error_handler: Optional[Mapping[int, BaseException]] = None) -> List[T]: ...
     
     @overload
     async def _build_result(self,
@@ -584,12 +584,12 @@ class Twitch:
                             url_params: dict,
                             auth_type: AuthType,
                             auth_scope: List[Union[AuthScope, List[AuthScope]]],
-                            return_type: Type[Sequence[str]],
+                            return_type: Type[List[str]],
                             body_data: Optional[dict] = None,
                             split_lists: bool = False,
                             get_from_data: bool = True,
                             result_type: ResultType = ResultType.RETURN_TYPE,
-                            error_handler: Optional[Mapping[int, BaseException]] = None) -> Sequence[str]: ...
+                            error_handler: Optional[Mapping[int, BaseException]] = None) -> List[str]: ...
     
     @overload
     async def _build_result(self,
@@ -611,12 +611,12 @@ class Twitch:
                             url_params: dict,
                             auth_type: AuthType,
                             auth_scope: List[Union[AuthScope, List[AuthScope]]],
-                            return_type: Union[Type[T], None, Type[Sequence[T]], Type[dict], Type[str], Type[Sequence[str]]],
+                            return_type: Union[Type[T], None, Type[List[T]], Type[dict], Type[str], Type[List[str]]],
                             body_data: Optional[dict] = None,
                             split_lists: bool = False,
                             get_from_data: bool = True,
                             result_type: ResultType = ResultType.RETURN_TYPE,
-                            error_handler: Optional[Mapping[int, BaseException]] = None) -> Union[T, None, int, str, Sequence[T], dict, str, Sequence[str]]:
+                            error_handler: Optional[Mapping[int, BaseException]] = None) -> Union[T, None, int, str, List[T], dict, str, List[str]]:
         async with ClientSession(timeout=self.session_timeout) as session:
             _url = build_url(self.base_url + url, url_params, remove_none=True, split_lists=split_lists)
             response = await self._api_request(method, session, _url, auth_type, auth_scope, data=body_data)
@@ -4221,3 +4221,33 @@ class Twitch:
             'broadcaster_id': broadcaster_id
         }
         return await self._build_result('GET', 'shared_chat/session', param, AuthType.EITHER, [], SharedChatSession)
+
+    async def get_clips_download(self,
+                                 editor_id: str,
+                                 broadcaster_id: str,
+                                 clip_ids: List[str]) -> List[ClipDownload]:
+        """Provides URLs to download the video file(s) for the specified clips.
+
+        Requires User or App Authentication with :const:`~twitchAPI.type.AuthScope.EDITOR_MANAGE_CLIPS` or :const:`~twitchAPI.type.AuthScope.CHANNEL_MANAGE_CLIPS`\n
+        For detailed documentation, see here: https://dev.twitch.tv/docs/api/reference#get-clips-download
+
+        :param editor_id: The User ID of the editor for the channel you want to download a clip for.
+                    If using the broadcaster’s auth token, this is the same as broadcaster_id. This must match the user_id in the user access token.
+        :param broadcaster_id: The ID of the broadcaster you want to download clips for.
+        :param clip_ids: List of clip IDs to download. Up to 10 allowed.
+        :raises ~twitchAPI.type.TwitchAPIException: if the request was malformed
+        :raises ~twitchAPI.type.UnauthorizedException: if user authentication is not set or invalid
+        :raises ~twitchAPI.type.TwitchAuthorizationException: if the used authentication token became invalid and a re authentication failed
+        :raises ~twitchAPI.type.TwitchBackendException: if the Twitch API itself runs into problems
+        :raises ~twitchAPI.type.TwitchAPIException: if a Query Parameter is missing or invalid
+        :raises ValueError: if clips_ids has more than 10 entries"""
+        if isinstance(clip_ids, list) and len(clip_ids) > 10:
+            raise ValueError('clip_ids has to be less than 10 entries long')
+        param = {
+            "editor_id": editor_id,
+            "broadcaster_id": broadcaster_id,
+            "clip_id": clip_ids
+        }
+        return await self._build_result('GET', 'clips/downloads', param, AuthType.EITHER,
+                                        [[AuthScope.CHANNEL_MANAGE_CLIPS, AuthScope.EDITOR_MANAGE_CLIPS]], List[ClipDownload],
+                                        split_lists=True)
