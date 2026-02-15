@@ -875,7 +875,7 @@ class EventSubBase(ABC):
         :raises ~twitchAPI.type.TwitchBackendException: if the subscription failed due to a twitch backend error
         :returns: The id of the topic subscription
         """
-        return await self._subscribe('channel.hype_train.begin', '1', {'broadcaster_user_id': broadcaster_user_id}, callback,
+        return await self._subscribe('channel.hype_train.begin', '2', {'broadcaster_user_id': broadcaster_user_id}, callback,
                                      HypeTrainEvent)
 
     async def listen_hype_train_progress(self, broadcaster_user_id: str, callback: Callable[[HypeTrainEvent], Awaitable[None]]) -> str:
@@ -895,7 +895,7 @@ class EventSubBase(ABC):
         :raises ~twitchAPI.type.TwitchBackendException: if the subscription failed due to a twitch backend error
         :returns: The id of the topic subscription
         """
-        return await self._subscribe('channel.hype_train.progress', '1', {'broadcaster_user_id': broadcaster_user_id}, callback,
+        return await self._subscribe('channel.hype_train.progress', '2', {'broadcaster_user_id': broadcaster_user_id}, callback,
                                      HypeTrainEvent)
 
     async def listen_hype_train_end(self, broadcaster_user_id: str, callback: Callable[[HypeTrainEndEvent], Awaitable[None]]) -> str:
@@ -915,7 +915,7 @@ class EventSubBase(ABC):
         :raises ~twitchAPI.type.TwitchBackendException: if the subscription failed due to a twitch backend error
         :returns: The id of the topic subscription
         """
-        return await self._subscribe('channel.hype_train.end', '1', {'broadcaster_user_id': broadcaster_user_id}, callback,
+        return await self._subscribe('channel.hype_train.end', '2', {'broadcaster_user_id': broadcaster_user_id}, callback,
                                      HypeTrainEndEvent)
 
     async def listen_stream_online(self, broadcaster_user_id: str, callback: Callable[[StreamOnlineEvent], Awaitable[None]]) -> str:
