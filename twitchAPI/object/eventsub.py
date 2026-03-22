@@ -32,7 +32,7 @@ __all__ = ['ChannelPollBeginEvent', 'ChannelUpdateEvent', 'ChannelFollowEvent', 
            'ChannelModeratorRemoveData', 'ChannelPointsCustomRewardData', 'GlobalCooldown', 'Image', 'MaxPerStream', 'MaxPerUserPerStream',
            'ChannelPointsCustomRewardRedemptionData', 'Reward', 'ChannelPollProgressData', 'ChannelPollEndData', 'ChannelPredictionData', 'Outcome',
            'TopPredictors', 'ChannelPredictionEndData', 'DropEntitlementGrantData', 'Entitlement', 'Product', 'ExtensionBitsTransactionCreateData',
-           'GoalData', 'TopContribution', 'LastContribution', 'HypeTrainData', 'HypeTrainEndData', 'StreamOnlineData', 'StreamOfflineData',
+           'GoalData', 'TopContribution', 'HypeTrainData', 'HypeTrainEndData', 'StreamOnlineData', 'StreamOfflineData',
            'UserAuthorizationGrantData', 'UserAuthorizationRevokeData', 'UserUpdateData', 'ShieldModeData', 'Amount', 'CharityCampaignStartData',
            'CharityCampaignStopData', 'CharityCampaignProgressData', 'CharityDonationData', 'ChannelShoutoutCreateData', 'ChannelShoutoutReceiveData',
            'ChannelChatClearData', 'ChannelChatClearUserMessagesData', 'ChannelChatMessageDeleteData', 'Badge', 'MessageFragmentCheermote',
@@ -747,23 +747,13 @@ class TopContribution(TwitchObject):
     to represent tier 1, 2, or 3 subscriptions, respectively."""
 
 
-class LastContribution(TwitchObject):
-    user_id: str
-    """The ID of the user that made the contribution."""
-    user_login: str
-    """The user’s login name."""
-    user_name: str
-    """The user’s display name."""
-    type: str
-    """The contribution method used. Possible values are:
-    
-    - bits — Cheering with Bits.
-    - subscription — Subscription activity like subscribing or gifting subscriptions.
-    - other — Covers other contribution methods not listed.
-    """
-    total: int
-    """The total amount contributed. If type is bits, total represents the amount of Bits used. If type is subscription, total is 500, 1000, or 2500 
-    to represent tier 1, 2, or 3 subscriptions, respectively."""
+class SharedTrainParticipants(TwitchObject):
+    broadcaster_user_id: str
+    """The broadcaster participating in the shared Hype Train."""
+    broadcaster_user_login: str
+    """The broadcaster participating in the shared Hype Train."""
+    broadcaster_user_name: str
+    """The display name of the broadcaster participating in the shared Hype Train."""
 
 
 class HypeTrainData(TwitchObject):
@@ -783,16 +773,22 @@ class HypeTrainData(TwitchObject):
     """The number of points required to reach the next level."""
     top_contributions: List[TopContribution]
     """The contributors with the most points contributed."""
-    last_contribution: LastContribution
-    """The most recent contribution."""
     level: int
     """The starting level of the Hype Train."""
+    all_time_high_level: Optional[int]
+    """The all-time high level this type of Hype Train has reached for this broadcaster."""
+    all_time_high_total: Optional[int]
+    """The all-time high total this type of Hype Train has reached for this broadcaster."""
+    shared_train_participants: Optional[List[SharedTrainParticipants]]
+    """Optional list of broadcasters in the shared Hype Train."""
     started_at: datetime
     """The time when the Hype Train started."""
     expires_at: datetime
     """The time when the Hype Train expires. The expiration is extended when the Hype Train reaches a new level."""
-    is_golden_kappa_train: bool
-    """Indicates if the Hype Train is a Golden Kappa Train."""
+    type: str
+    """The type of the Hype Train. Possible values: treasure, golden_kappa, regular."""
+    is_shared_train: bool
+    """Indicates if the Hype Train is shared. When true, shared_train_participants will contain the list of broadcasters the train is shared with."""
 
 
 class HypeTrainEndData(TwitchObject):
@@ -804,20 +800,24 @@ class HypeTrainEndData(TwitchObject):
     """The requested broadcaster login."""
     broadcaster_user_name: str
     """The requested broadcaster display name."""
-    level: int
-    """The final level of the Hype Train."""
     total: int
     """Total points contributed to the Hype Train."""
     top_contributions: List[TopContribution]
     """The contributors with the most points contributed."""
+    level: int
+    """The final level of the Hype Train."""
+    shared_train_participants: Optional[List[SharedTrainParticipants]]
+    """Optional list of broadcasters in the shared Hype Train."""
     started_at: datetime
     """The time when the Hype Train started."""
-    ended_at: datetime
-    """The time when the Hype Train ended."""
     cooldown_ends_at: datetime
     """The time when the Hype Train cooldown ends so that the next Hype Train can start."""
-    is_golden_kappa_train: bool
-    """Indicates if the Hype Train is a Golden Kappa Train."""
+    ended_at: datetime
+    """The time when the Hype Train ended."""
+    type: str
+    """The type of the Hype Train. Possible values: treasure, golden_kappa, regular."""
+    is_shared_train: bool
+    """Indicates if the Hype Train is shared. When true, shared_train_participants will contain the list of broadcasters the train is shared with."""
 
 
 class StreamOnlineData(TwitchObject):
