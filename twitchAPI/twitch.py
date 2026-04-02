@@ -289,6 +289,36 @@ class Twitch:
         # ensure that asyncio actually gracefully shut down
         await asyncio.sleep(0.25)
 
+    def clone(self) -> 'Twitch':
+        """
+        Creates a clone of this instance with the same authentication and configuration.
+        This is useful if you want to use the same authentication without having to reauthenticate.
+        
+        :return: A cloned instance of Twitch
+        """
+        t = Twitch(self.app_id, 
+                   self.app_secret, 
+                   authenticate_app=False, 
+                   target_app_auth_scope=self._target_app_scope, 
+                   base_url=self.base_url, 
+                   auth_base_url=self.auth_base_url, 
+                   session_timeout=self.session_timeout)
+        
+        t._app_auth_token = self._app_auth_token
+        t._app_auth_scope = self._app_auth_scope.copy()
+        t._has_app_auth = self._has_app_auth
+        
+        t._user_auth_token = self._user_auth_token
+        t._user_auth_refresh_token = self._user_auth_refresh_token
+        t._user_auth_scope = self._user_auth_scope.copy()
+        t._has_user_auth = self._has_user_auth
+        
+        t.auto_refresh_auth = self.auto_refresh_auth
+        t.user_auth_refresh_callback = self.user_auth_refresh_callback
+        t.app_auth_refresh_callback = self.app_auth_refresh_callback
+        
+        return t
+
     def _generate_header(self, auth_type: 'AuthType', required_scope: List[Union[AuthScope, List[AuthScope]]]) -> dict:
         header = {"Client-ID": self.app_id}
         if auth_type == AuthType.EITHER:
