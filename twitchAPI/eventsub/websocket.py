@@ -237,7 +237,12 @@ class EventSubWebsocket(EventSubBase):
     def _set_connection_state(self, state: ConnectionState) -> None:
         """Record ``state`` and notify the handler synchronously outside the state lock.
 
-        The handler must not block or call back into the client.
+        The handler is invoked synchronously, outside the state lock, so it may be called
+        concurrently and out of order from different threads (for example the thread that called
+        :meth:`start`/:meth:`stop` and the socket thread). It must therefore be thread-safe and
+        must not block. If the handler observes a last state other than the one it expected,
+        :attr:`connection_state` is the source of truth. Re-entrant calls (such as :meth:`stop`)
+        are supported; the handler should avoid blocking them rather than refrain from making them.
         """
         with self._state_lock:
             if state == self._connection_state:
@@ -555,6 +560,8 @@ class EventSubWebsocket(EventSubBase):
             if not self._active_subscriptions:  # Restore old subscriptions for next reconnect
                 self._active_subscriptions = subs
             return
+        # NOTE: asyncio.CancelledError is a BaseException and is not caught above, so a cancelled
+        # reconnect leaves the active-subscription map intentionally cleared while aborting.
         self.logger.debug('done resubscribing!')
 
     def _reset_timeout(self):

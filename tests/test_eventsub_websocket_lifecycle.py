@@ -594,7 +594,7 @@ def _reconnect_request() -> dict:
     }
 
 
-def test_eventsub_state_transitions_are_serialized() -> None:
+def test_eventsub_state_updates_are_atomic_and_deadlock_free() -> None:
     entered = threading.Event()
     release = threading.Event()
     calls = []

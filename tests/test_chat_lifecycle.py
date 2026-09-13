@@ -273,7 +273,7 @@ def test_chat_state_handler_exception_is_swallowed() -> None:
     assert chat.connection_state is ConnectionState.READY
 
 
-def test_chat_state_transitions_are_serialized() -> None:
+def test_chat_state_updates_are_atomic_and_deadlock_free() -> None:
     entered = threading.Event()
     release = threading.Event()
     calls = []
