@@ -2,14 +2,19 @@ import asyncio
 import logging
 import threading
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
+from twitchAPI.eventsub import websocket as eventsub_websocket
 from twitchAPI.eventsub.websocket import EventSubWebsocket, _validate_subscription_response
 from twitchAPI.type import EventSubSubscriptionError
 
 
 class _FakeTwitch:
+    session_timeout = 30
+    base_url = 'https://api.twitch.tv/helix/'
+
     def has_required_auth(self, *_args, **_kwargs) -> bool:
         return True
 
@@ -63,6 +68,10 @@ def _expect_invalid(item) -> None:
         (202, {'data': [{**_valid_subscription(), 'type': 'stream.online'}]}),
         (202, {'data': [{**_valid_subscription(), 'version': '2'}]}),
         (202, {'data': [{**_valid_subscription(), 'transport': {'method': 'webhook'}}]}),
+        (202, {}),
+        (202, {'data': 'not-a-list'}),
+        (202, {'data': ['not-a-dict']}),
+        (202, {'data': [None]}),
     ],
 )
 def test_subscription_success_shape_is_strict(status: int, payload: dict) -> None:
@@ -126,6 +135,63 @@ def test_subscription_error_does_not_leak_sensitive_data() -> None:
     assert message == 'invalid subscription response'
     assert secret not in message
     assert 'session-1' not in message
+
+
+class _FakeHttpResponse:
+    def __init__(self, status: int, payload: dict) -> None:
+        self.status = status
+        self._payload = payload
+
+    async def json(self) -> dict:
+        return self._payload
+
+
+class _FakeClientSession:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def __aenter__(self) -> '_FakeClientSession':
+        return self
+
+    async def __aexit__(self, *_exc_info) -> bool:
+        return False
+
+
+class _SomeEvent:
+    pass
+
+
+def test_malformed_subscribe_response_registers_no_callback(monkeypatch) -> None:
+    async def callback(event) -> None:
+        pass
+
+    async def fake_post_request(session, url, data=None):
+        malformed = {**_valid_subscription(), 'status': 'pending'}
+        return _FakeHttpResponse(202, {'data': [malformed]})
+
+    monkeypatch.setattr(eventsub_websocket, 'ClientSession', _FakeClientSession)
+
+    async def scenario() -> None:
+        client = _new_eventsub(
+            _callbacks={},
+            _active_subscriptions={},
+            active_session=SimpleNamespace(id='session-1'),
+            subscription_url='https://example.invalid/',
+        )
+        client._api_post_request = fake_post_request
+
+        with pytest.raises(EventSubSubscriptionError, match='invalid subscription response'):
+            await client._subscribe(
+                'channel.chat.message',
+                '1',
+                {'broadcaster_user_id': '1', 'user_id': '2'},
+                callback,
+                _SomeEvent,
+            )
+        assert client._callbacks == {}
+        assert client._active_subscriptions == {}
+
+    asyncio.run(scenario())
 
 
 def _notification(message_id, sub_id: str = 'sub-1') -> dict:
