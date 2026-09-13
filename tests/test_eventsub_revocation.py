@@ -138,6 +138,10 @@ def test_unknown_revocation_does_not_touch_unrelated_subscriptions() -> None:
 
 
 _MALFORMED_REVOCATIONS = [
+    None,
+    'not-a-dict',
+    ['not-a-dict'],
+    123,
     {},
     {'payload': None},
     {'payload': 'not-a-dict'},
