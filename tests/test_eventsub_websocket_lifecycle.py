@@ -851,7 +851,9 @@ def test_eventsub_first_welcome_sets_is_ready() -> None:
 
 
 def test_eventsub_connect_reconnect_entry_clears_is_ready() -> None:
-    client = _new_eventsub(_ready=True, _session=_FakeWebsocketSession())
+    client = _new_eventsub(_session=_FakeWebsocketSession())
+    client._set_connection_state(ConnectionState.READY)
+    assert client.is_ready is True
     asyncio.run(client._connect(is_startup=False))
     assert client.connection_state is ConnectionState.RECONNECTING
     assert client.is_ready is False
@@ -875,8 +877,9 @@ def test_eventsub_handle_reconnect_clears_then_handover_sets_is_ready() -> None:
             _active_subscriptions={},
             _callbacks={},
             _running=True,
-            _ready=True,
         )
+        client._set_connection_state(ConnectionState.READY)
+        assert client.is_ready is True
         receive_task = asyncio.ensure_future(client._task_receive())
         try:
             old_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_reconnect_request())))
@@ -894,12 +897,77 @@ def test_eventsub_handle_reconnect_clears_then_handover_sets_is_ready() -> None:
 
 
 def test_eventsub_stop_and_startup_failure_clear_is_ready() -> None:
-    stopped = _new_eventsub(_ready=True, _running=True, _socket_thread=None, _socket_loop=None)
+    stopped = _new_eventsub(_running=True, _socket_thread=None, _socket_loop=None)
+    stopped._set_connection_state(ConnectionState.READY)
+    assert stopped.is_ready is True
     asyncio.run(stopped.stop(timeout=1.0))
     assert stopped.is_ready is False
 
-    failed = _new_eventsub(_ready=True)
+    failed = _new_eventsub()
+    failed._set_connection_state(ConnectionState.READY)
+    assert failed.is_ready is True
     failed._run_socket = lambda: None
     with pytest.raises(RuntimeError):
         failed.start()
     assert failed.is_ready is False
+
+
+async def _noop(*_args, **_kwargs) -> None:
+    return None
+
+
+async def _drain_cancelled(tasks) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+_ALL_STATES = (
+    ConnectionState.STARTING,
+    ConnectionState.READY,
+    ConnectionState.RECONNECTING,
+    ConnectionState.FAILED,
+    ConnectionState.STOPPING,
+    ConnectionState.STOPPED,
+)
+
+
+def test_eventsub_is_ready_is_derived_from_connection_state() -> None:
+    client = _new_eventsub()
+    for state in _ALL_STATES:
+        client._set_connection_state(state)
+        assert client.connection_state is state
+        assert client.is_ready is (state is ConnectionState.READY)
+
+
+def test_eventsub_stopping_handler_observes_not_ready() -> None:
+    observed = []
+
+    def handler(state) -> None:
+        observed.append((state, client.is_ready))
+
+    client = _new_eventsub(state_change_handler=handler, _running=True)
+    client._set_connection_state(ConnectionState.READY)
+    assert client.is_ready is True
+    asyncio.run(client.stop(timeout=0.1))
+    assert (ConnectionState.STOPPING, False) in observed
+    assert (ConnectionState.STOPPED, False) in observed
+
+
+def test_eventsub_socket_exit_without_closing_reports_failed_and_not_ready() -> None:
+    states = []
+    client = _new_eventsub(state_change_handler=states.append, _closing=False, _ready=True)
+    client._connect = _noop
+    client._task_receive = _noop
+    client._task_reconnect_handler = _noop
+    client._keep_loop_alive = _noop
+    client._run_socket()
+    socket_loop = client._socket_loop
+    try:
+        assert states == [ConnectionState.FAILED]
+        assert client.connection_state is ConnectionState.FAILED
+        assert client.is_ready is False
+    finally:
+        socket_loop.run_until_complete(_drain_cancelled(client._tasks))
+        socket_loop.close()
+        asyncio.set_event_loop(None)

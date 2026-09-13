@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from twitchAPI.chat import Chat
-from twitchAPI.type import ConnectionState
+from twitchAPI.type import ChatEvent, ConnectionState
 
 
 class _FakeTwitch:
@@ -30,6 +30,7 @@ def _new_chat(**attrs) -> Chat:
     chat._callback_loop = None
     chat._configured_callback_loop = None
     chat._state_lock = threading.RLock()
+    chat._task_callback = lambda _task: None
     if 'state_change_handler' in attrs:
         chat._state_change_handler = attrs.pop('state_change_handler')
     for key, value in attrs.items():
@@ -431,3 +432,64 @@ def test_chat_reconnect_handover_restores_is_ready() -> None:
     asyncio.run(chat._handle_ready({'parameters': None, 'tags': {}}))
     assert chat.connection_state is ConnectionState.READY
     assert chat.is_ready is True
+
+
+_ALL_STATES = (
+    ConnectionState.STARTING,
+    ConnectionState.READY,
+    ConnectionState.RECONNECTING,
+    ConnectionState.FAILED,
+    ConnectionState.STOPPING,
+    ConnectionState.STOPPED,
+)
+
+
+def test_chat_is_ready_is_derived_from_connection_state() -> None:
+    chat = _new_chat()
+    for state in _ALL_STATES:
+        chat._set_connection_state(state)
+        assert chat.connection_state is state
+        assert chat.is_ready is (state is ConnectionState.READY)
+
+
+def test_chat_stopping_handler_observes_not_ready() -> None:
+    observed = []
+
+    def handler(state) -> None:
+        observed.append((state, chat.is_ready))
+
+    chat = _new_chat(state_change_handler=handler, _Chat__running=True)
+    chat._set_connection_state(ConnectionState.READY)
+    assert chat.is_ready is True
+    chat.stop(timeout=0.1)
+    assert (ConnectionState.STOPPING, False) in observed
+    assert (ConnectionState.STOPPED, False) in observed
+
+
+async def _drain_dispatch() -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+def test_chat_ready_event_is_reemitted_after_reconnect() -> None:
+    fired = []
+
+    async def handler(event) -> None:
+        fired.append(event)
+
+    async def scenario() -> None:
+        chat = _new_chat()
+        chat._event_handler = {ChatEvent.READY: [handler]}
+
+        await chat._handle_ready({'parameters': None, 'tags': {}})
+        await _drain_dispatch()
+        assert len(fired) == 1
+
+        chat._Chat__connect = _noop
+        chat._Chat__task_startup = _noop
+        await chat._handle_base_reconnect()
+        await chat._handle_ready({'parameters': None, 'tags': {}})
+        await _drain_dispatch()
+        assert len(fired) == 2
+
+    asyncio.run(scenario())

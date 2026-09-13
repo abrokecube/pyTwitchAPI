@@ -838,7 +838,6 @@ class Chat:
             raise UnauthorizedException('CHAT_READ authscope is required to run a chat bot')
         self.__startup_complete = False
         self._closing = False
-        self._ready = False
         self._set_connection_state(ConnectionState.STARTING)
         self.__socket_thread = threading.Thread(target=self.__run_socket)
         self.__running = True
@@ -850,7 +849,6 @@ class Chat:
                 self.__socket_thread = None
                 self.__socket_loop = None
                 self.__running = False
-                self._ready = False
                 self._set_connection_state(ConnectionState.FAILED)
                 raise RuntimeError('Chat socket thread died during startup')
             sleep(0.01)
@@ -874,7 +872,6 @@ class Chat:
         self._set_connection_state(ConnectionState.STOPPING)
         self.__startup_complete = False
         self.__running = False
-        self._ready = False
         deadline = None if timeout is None else monotonic() + timeout
         if self.__socket_loop is not None:
             f = asyncio.run_coroutine_threadsafe(self._stop(), self.__socket_loop)
@@ -935,6 +932,7 @@ class Chat:
             if state == self._connection_state:
                 return
             self._connection_state = state
+            self._ready = (state is ConnectionState.READY)
             handler = self._state_change_handler
         notify_state_change(handler, state, self.logger)
 
@@ -1083,7 +1081,6 @@ class Chat:
             return
 
     async def _handle_base_reconnect(self):
-        self._ready = False
         self._set_connection_state(ConnectionState.RECONNECTING)
         await self.__connect(is_startup=False)
         await self.__task_startup()
@@ -1198,7 +1195,6 @@ class Chat:
         self.logger.debug('got ready event')
         dat = EventData(self)
         was_ready = self._ready
-        self._ready = True
         self._set_connection_state(ConnectionState.READY)
         if self._join_target is not None and len(self._join_target) > 0:
             _failed = await self.join_room(self._join_target)

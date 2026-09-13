@@ -249,6 +249,7 @@ class EventSubWebsocket(EventSubBase):
             if state == self._connection_state:
                 return
             self._connection_state = state
+            self._ready = (state is ConnectionState.READY)
             handler = self._state_change_handler
         notify_state_change(handler, state, self.logger)
 
@@ -296,7 +297,6 @@ class EventSubWebsocket(EventSubBase):
         if not self._twitch.has_required_auth(AuthType.USER, []):
             raise UnauthorizedException('Twitch needs user authentication')
         self._startup_complete = False
-        self._ready = False
         self._closing = False
         self._set_connection_state(ConnectionState.STARTING)
         self._socket_thread = threading.Thread(target=self._run_socket)
@@ -310,7 +310,6 @@ class EventSubWebsocket(EventSubBase):
                 self._socket_thread = None
                 self._socket_loop = None
                 self._running = False
-                self._ready = False
                 self._set_connection_state(ConnectionState.FAILED)
                 raise RuntimeError('EventSubWebsocket socket thread died during startup')
             sleep(0.01)
@@ -332,7 +331,6 @@ class EventSubWebsocket(EventSubBase):
         self._set_connection_state(ConnectionState.STOPPING)
         self._startup_complete = False
         self._running = False
-        self._ready = False
         deadline = None if timeout is None else monotonic() + timeout
         if self._socket_loop is not None:
             f = asyncio.run_coroutine_threadsafe(self._stop(), self._socket_loop)
@@ -407,7 +405,6 @@ class EventSubWebsocket(EventSubBase):
             self.logger.debug(f'connecting to {self.connection_url}...')
         else:
             self._is_reconnecting = True
-            self._ready = False
             self._set_connection_state(ConnectionState.RECONNECTING)
             self.logger.debug(f'reconnecting using {self.connection_url}...')
         self._reconnect_timeout = None
@@ -515,7 +512,6 @@ class EventSubWebsocket(EventSubBase):
                         self._is_reconnecting = False
                         if self._active_subscriptions:
                             await self._resubscribe()
-                        self._ready = True
                         self._set_connection_state(ConnectionState.READY)
                         self.logger.debug("websocket session_reconnect completed")
                         continue
@@ -586,7 +582,6 @@ class EventSubWebsocket(EventSubBase):
         session = data.get('payload', {}).get('session', {})
         new_session = Session.from_twitch(session)
         self.logger.debug(f"got request from websocket to reconnect, reconnect url: {new_session.reconnect_url}")
-        self._ready = False
         self._set_connection_state(ConnectionState.RECONNECTING)
         self._reset_timeout()
         new_connection = None
@@ -636,7 +631,6 @@ class EventSubWebsocket(EventSubBase):
             await self._resubscribe()
         self._is_reconnecting = False
         self._startup_complete = True
-        self._ready = True
         self._set_connection_state(ConnectionState.READY)
 
     async def _handle_keepalive(self, data: dict):
