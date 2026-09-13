@@ -4,6 +4,7 @@ Type Definitions
 ----------------"""
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 from typing_extensions import TypedDict
 from enum_tools.documentation import document_enum
 
@@ -14,7 +15,31 @@ __all__ = ['AnalyticsReportType', 'AuthScope', 'ModerationEventType', 'TimePerio
            'TwitchAPIException', 'InvalidRefreshTokenException', 'InvalidTokenException', 'NotFoundException', 'TwitchAuthorizationException',
            'UnauthorizedException', 'MissingScopeException', 'TwitchBackendException', 'MissingAppSecretException',
            'EventSubSubscriptionTimeout', 'EventSubSubscriptionConflict', 'EventSubSubscriptionError', 'DeprecatedError', 'TwitchResourceNotFound',
-           'ForbiddenError']
+           'ForbiddenError', 'ConnectionState', 'ConnectionStateHandler']
+
+
+class ConnectionState(Enum):
+    """Public, sanitized state of a websocket based client.
+
+    The value is the only data ever handed to a :const:`~twitchAPI.type.ConnectionStateHandler`; no URLs,
+    session IDs, tokens, headers or exception bodies are exposed.
+    """
+    STARTING = 'starting'
+    """The client has been asked to start and is connecting."""
+    READY = 'ready'
+    """The client is connected and ready to receive events."""
+    RECONNECTING = 'reconnecting'
+    """The client lost its connection and is re-establishing it."""
+    STOPPING = 'stopping'
+    """The client has been asked to stop."""
+    STOPPED = 'stopped'
+    """The socket thread has terminated."""
+    FAILED = 'failed'
+    """Startup failed or the socket thread died unexpectedly."""
+
+
+ConnectionStateHandler = Callable[[ConnectionState], None]
+"""Callable notified with the new :const:`~twitchAPI.type.ConnectionState` at every state change."""
 
 
 class AnalyticsReportType(Enum):

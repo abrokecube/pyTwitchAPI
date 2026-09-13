@@ -1,14 +1,16 @@
 import asyncio
+import json
 import logging
 import threading
 from collections import deque
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 from twitchAPI.eventsub import websocket as eventsub_websocket
-from twitchAPI.eventsub.websocket import EventSubWebsocket, _validate_subscription_response
-from twitchAPI.type import EventSubSubscriptionError
+from twitchAPI.eventsub.websocket import EventSubWebsocket, Session, _validate_subscription_response
+from twitchAPI.type import ConnectionState, EventSubSubscriptionError
 
 
 class _FakeTwitch:
@@ -29,7 +31,15 @@ def _new_eventsub(**attrs) -> EventSubWebsocket:
     client._startup_complete = False
     client._ready = False
     client._closing = False
+    client._connection = None
+    client._session = None
+    client._callback_loop = None
+    client.connection_url = 'wss://example.invalid/ws'
+    client._is_reconnecting = False
+    client._reconnect_timeout = None
     client._task_callback = lambda _task: None
+    if 'state_change_handler' in attrs:
+        client._state_change_handler = attrs.pop('state_change_handler')
     for key, value in attrs.items():
         setattr(client, key, value)
     return client
@@ -375,3 +385,259 @@ def test_eventsub_stop_from_socket_thread_raises() -> None:
         loop_thread.join(1.0)
         loop.close()
     assert loop_thread.is_alive() is False
+
+
+# --- connection state projection ---
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def receive(self, timeout=None):
+        return await self._queue.get()
+
+    def push(self, message) -> None:
+        self._queue.put_nowait(message)
+
+    def exception(self):
+        return None
+
+
+class _FakeWebsocketSession:
+    async def ws_connect(self, _url: str) -> _FakeConnection:
+        return _FakeConnection()
+
+
+class _HandoverSession:
+    def __init__(self, connection: _FakeConnection) -> None:
+        self._connection = connection
+
+    async def ws_connect(self, _url: str) -> _FakeConnection:
+        return self._connection
+
+
+class _FakeWSMessage:
+    def __init__(self, msg_type, data: str) -> None:
+        self.type = msg_type
+        self.data = data
+
+    def json(self) -> dict:
+        return json.loads(self.data)
+
+
+def _welcome(session_id: str, keepalive_timeout_seconds: int = 30) -> dict:
+    return {
+        'metadata': {'message_type': 'session_welcome'},
+        'payload': {
+            'session': {
+                'id': session_id,
+                'keepalive_timeout_seconds': keepalive_timeout_seconds,
+                'status': 'connected',
+                'reconnect_url': 'wss://example.invalid/reconnect',
+            }
+        },
+    }
+
+
+def test_eventsub_connection_state_cycle_is_ordered() -> None:
+    states = []
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    release = threading.Event()
+    helper_started = threading.Event()
+
+    def fake_run_socket() -> None:
+        client._socket_loop = loop
+        client._callback_loop = loop
+        client._startup_complete = True
+        helper_started.set()
+        release.wait(2.0)
+
+    async def short_stop() -> None:
+        release.set()
+
+    client = _new_eventsub(
+        state_change_handler=states.append,
+        _session=_FakeWebsocketSession(),
+    )
+    client._run_socket = fake_run_socket
+    client._stop = short_stop
+    try:
+        client.start()
+        assert helper_started.wait(1.0)
+
+        async def first_welcome() -> None:
+            await client._handle_welcome(_welcome('sess-1'))
+
+        asyncio.run(first_welcome())
+
+        async def reconnect() -> None:
+            await client._connect(is_startup=False)
+
+        asyncio.run(reconnect())
+
+        async def second_welcome() -> None:
+            client._is_reconnecting = True
+            await client._handle_welcome(_welcome('sess-2'))
+
+        asyncio.run(second_welcome())
+
+        asyncio.run(client.stop(timeout=1.0))
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+
+    assert loop_thread.is_alive() is False
+    assert states == [
+        ConnectionState.STARTING,
+        ConnectionState.READY,
+        ConnectionState.RECONNECTING,
+        ConnectionState.READY,
+        ConnectionState.STOPPING,
+        ConnectionState.STOPPED,
+    ]
+
+
+def test_eventsub_partial_start_reports_failed() -> None:
+    states = []
+    client = _new_eventsub(state_change_handler=states.append)
+    client._run_socket = lambda: None
+    with pytest.raises(RuntimeError):
+        client.start()
+    assert states == [ConnectionState.STARTING, ConnectionState.FAILED]
+
+
+def test_eventsub_stop_reports_stopping_and_stopped() -> None:
+    states = []
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    release = threading.Event()
+    helper_started = threading.Event()
+
+    def socket_helper() -> None:
+        helper_started.set()
+        release.wait(2.0)
+
+    helper = threading.Thread(target=socket_helper)
+    helper.start()
+    assert helper_started.wait(1.0)
+
+    async def short_stop() -> None:
+        release.set()
+
+    client = _new_eventsub(
+        state_change_handler=states.append,
+        _running=True,
+        _socket_loop=loop,
+        _socket_thread=helper,
+    )
+    client._stop = short_stop
+    try:
+        asyncio.run(client.stop(timeout=1.0))
+    finally:
+        release.set()
+        helper.join(1.0)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+
+    assert states == [ConnectionState.STOPPING, ConnectionState.STOPPED]
+
+
+def test_eventsub_state_payloads_are_enum_only() -> None:
+    captured = []
+    client = _new_eventsub(state_change_handler=captured.append)
+    client._set_connection_state(ConnectionState.STARTING)
+    client._set_connection_state(ConnectionState.READY)
+    assert captured == [ConnectionState.STARTING, ConnectionState.READY]
+    assert all(isinstance(state, ConnectionState) for state in captured)
+    text = repr(captured)
+    for secret in ('wss://', 'sess-1', 'Bearer', 'Authorization', 'token'):
+        assert secret not in text
+
+
+def test_eventsub_state_handler_exception_is_swallowed() -> None:
+    def handler(_state) -> None:
+        raise RuntimeError('handler boom token=super-secret')
+
+    client = _new_eventsub(state_change_handler=handler)
+    client._set_connection_state(ConnectionState.STARTING)
+    client._set_connection_state(ConnectionState.READY)
+    assert client.connection_state is ConnectionState.READY
+
+
+def _reconnect_request() -> dict:
+    return {
+        'metadata': {'message_type': 'session_reconnect'},
+        'payload': {
+            'session': {
+                'id': 'sess-old',
+                'keepalive_timeout_seconds': 30,
+                'status': 'reconnect',
+                'reconnect_url': 'wss://example.invalid/reconnect',
+            }
+        },
+    }
+
+
+def test_eventsub_reconnect_handover_deduplicates_redelivered_message() -> None:
+    delivered = []
+
+    async def callback(event) -> None:
+        delivered.append(event)
+
+    async def scenario() -> None:
+        old_connection = _FakeConnection()
+        new_connection = _FakeConnection()
+        client = _new_eventsub(
+            _callbacks={'sub-1': {'id': 'sub-1', 'callback': callback, 'active': True, 'event': lambda **kw: kw}},
+            _msg_id_history=deque(maxlen=5),
+            _callback_loop=asyncio.get_running_loop(),
+            _connection=old_connection,
+            active_session=Session(
+                id='sess-old',
+                keepalive_timeout_seconds=30,
+                status='connected',
+                reconnect_url=None,
+            ),
+            _session=_HandoverSession(new_connection),
+            _active_subscriptions={},
+            _is_reconnecting=True,
+            _reset_timeout=lambda: None,
+        )
+
+        reconnect_task = asyncio.ensure_future(client._handle_reconnect(_reconnect_request()))
+        await asyncio.sleep(0)
+        # the replacement welcome is delayed, so the handover is still pending
+        assert reconnect_task.done() is False
+
+        # the old socket must stay consumable until the replacement session is ready
+        await client._handle_notification(_notification('m-handover'))
+        await _drain_tasks()
+        assert len(delivered) == 1
+
+        # now the replacement welcome arrives and the swap happens
+        new_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_welcome('sess-new'))))
+        await asyncio.wait_for(reconnect_task, 1.0)
+
+        client._connection = client._reconnect.connection
+        client.active_session = client._reconnect.session
+        client._reconnect = None
+        await client._handle_welcome(_welcome('sess-new'))
+
+        # the replacement redelivers the same message id -> exactly one callback total
+        await client._handle_notification(_notification('m-handover'))
+        await _drain_tasks()
+        assert len(delivered) == 1
+
+    asyncio.run(scenario())
+
+

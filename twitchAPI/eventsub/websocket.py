@@ -99,9 +99,9 @@ from .base import EventSubBase
 __all__ = ['EventSubWebsocket']
 
 from twitchAPI.twitch import Twitch
-from ..helper import TWITCH_EVENT_SUB_WEBSOCKET_URL, done_task_callback
+from ..helper import TWITCH_EVENT_SUB_WEBSOCKET_URL, done_task_callback, submit_coroutine, notify_state_change
 from ..type import AuthType, UnauthorizedException, TwitchBackendException, EventSubSubscriptionConflict, EventSubSubscriptionError, \
-    TwitchAuthorizationException
+    TwitchAuthorizationException, ConnectionState, ConnectionStateHandler
 
 
 def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
@@ -164,14 +164,17 @@ class Reconnect:
 
 class EventSubWebsocket(EventSubBase):
     _reconnect: Optional[Reconnect] = None
-    
+    _connection_state: ConnectionState = ConnectionState.STOPPED
+    _state_change_handler: Optional[ConnectionStateHandler] = None
+
     def __init__(self,
                  twitch: Twitch,
                  connection_url: Optional[str] = None,
                  subscription_url: Optional[str] = None,
                  callback_loop: Optional[asyncio.AbstractEventLoop] = None,
                  revocation_handler: Optional[Callable[[dict], Awaitable[None]]] = None,
-                 message_deduplication_history_length: int = 50):
+                 message_deduplication_history_length: int = 50,
+                 state_change_handler: Optional[ConnectionStateHandler] = None):
         """
         :param twitch: The Twitch instance to be used
         :param connection_url: Alternative connection URL, useful for development with the twitch-cli
@@ -181,6 +184,8 @@ class EventSubWebsocket(EventSubBase):
             Defaults to the one used by EventSub Websocket.
         :param revocation_handler: Optional handler for when subscriptions get revoked. |default| :code:`None`
         :param message_deduplication_history_length: The amount of messages being considered for the duplicate message deduplication. |default| :code:`50`
+        :param state_change_handler: Optional callback that is notified with the new
+            :const:`~twitchAPI.type.ConnectionState` whenever the connection state changes. |default| :code:`None`
         """
         super().__init__(twitch, 'twitchAPI.eventsub.websocket')
         self.subscription_url: Optional[str] = subscription_url
@@ -200,6 +205,8 @@ class EventSubWebsocket(EventSubBase):
         self._connection = None
         self._session = None
         self._callback_loop = callback_loop
+        self._state_change_handler = state_change_handler
+        self._connection_state = ConnectionState.STOPPED
         self._is_reconnecting: bool = False
         self._active_subscriptions = {}
         self._msg_id_history: deque = deque(maxlen=message_deduplication_history_length)
@@ -219,6 +226,31 @@ class EventSubWebsocket(EventSubBase):
     def is_ready(self) -> bool:
         """Returns :code:`True` once the EventSub session is connected and ready."""
         return self._ready
+
+    @property
+    def connection_state(self) -> ConnectionState:
+        """The current, sanitized :const:`~twitchAPI.type.ConnectionState` of the EventSub client."""
+        return self._connection_state
+
+    def _set_connection_state(self, state: ConnectionState) -> None:
+        if state == self._connection_state:
+            return
+        self._connection_state = state
+        notify_state_change(self._state_change_handler, state, self.logger)
+
+    def _dispatch_callback(self, coroutine) -> None:
+        """Run a user callback on the configured callback loop.
+
+        When the callback loop is the loop that is currently running (the socket loop), a plain task is
+        created. When it is a different loop it is submitted with :func:`~twitchAPI.helper.submit_coroutine`
+        so that it is safe to call from the socket thread.
+        """
+        running_loop = asyncio.get_running_loop()
+        if self._callback_loop is not None and self._callback_loop is not running_loop:
+            submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
+        else:
+            task = asyncio.ensure_future(coroutine, loop=running_loop)
+            task.add_done_callback(self._task_callback)
 
     def wait_closed(self, timeout: Optional[float] = None) -> bool:
         """Wait for the socket thread to terminate.
@@ -249,6 +281,7 @@ class EventSubWebsocket(EventSubBase):
         self._startup_complete = False
         self._ready = False
         self._closing = False
+        self._set_connection_state(ConnectionState.STARTING)
         self._socket_thread = threading.Thread(target=self._run_socket)
         self._running = True
         self._active_subscriptions = {}
@@ -261,6 +294,7 @@ class EventSubWebsocket(EventSubBase):
                 self._socket_loop = None
                 self._running = False
                 self._ready = False
+                self._set_connection_state(ConnectionState.FAILED)
                 raise RuntimeError('EventSubWebsocket socket thread died during startup')
             sleep(0.01)
         self.logger.debug('EventSubWebsocket started up!')
@@ -278,6 +312,7 @@ class EventSubWebsocket(EventSubBase):
         if self._socket_thread is threading.current_thread():
             raise RuntimeError('socket thread cannot stop itself')
         self.logger.debug('stopping websocket EventSub...')
+        self._set_connection_state(ConnectionState.STOPPING)
         self._startup_complete = False
         self._running = False
         self._ready = False
@@ -296,6 +331,7 @@ class EventSubWebsocket(EventSubBase):
                 raise TimeoutError('Twitch socket thread did not stop')
         self._socket_thread = None
         self._socket_loop = None
+        self._set_connection_state(ConnectionState.STOPPED)
 
     def _get_transport(self) -> dict:
         return {
@@ -354,6 +390,7 @@ class EventSubWebsocket(EventSubBase):
             self.logger.debug(f'connecting to {self.connection_url}...')
         else:
             self._is_reconnecting = True
+            self._set_connection_state(ConnectionState.RECONNECTING)
             self.logger.debug(f'reconnecting using {self.connection_url}...')
         self._reconnect_timeout = None
         if self._connection is not None and not self._connection.closed:
@@ -379,13 +416,19 @@ class EventSubWebsocket(EventSubBase):
             self._callback_loop = self._socket_loop
         asyncio.set_event_loop(self._socket_loop)
 
-        self._socket_loop.run_until_complete(self._connect(is_startup=True))
+        try:
+            self._socket_loop.run_until_complete(self._connect(is_startup=True))
 
-        self._tasks = [
-            asyncio.ensure_future(self._task_receive(), loop=self._socket_loop),
-            asyncio.ensure_future(self._task_reconnect_handler(), loop=self._socket_loop)
-        ]
-        self._socket_loop.run_until_complete(self._keep_loop_alive())
+            self._tasks = [
+                asyncio.ensure_future(self._task_receive(), loop=self._socket_loop),
+                asyncio.ensure_future(self._task_reconnect_handler(), loop=self._socket_loop)
+            ]
+            self._socket_loop.run_until_complete(self._keep_loop_alive())
+        finally:
+            if self._closing:
+                self._set_connection_state(ConnectionState.STOPPED)
+            else:
+                self._set_connection_state(ConnectionState.FAILED)
 
     async def _stop(self):
         await self._connection.close()
@@ -513,13 +556,13 @@ class EventSubWebsocket(EventSubBase):
         self._active_subscriptions.pop(sub_id)
         self._callbacks.pop(sub_id)
         if self.revokation_handler is not None:
-            t = self._callback_loop.create_task(self.revokation_handler(_payload))
-            t.add_done_callback(self._task_callback)
+            self._dispatch_callback(self.revokation_handler(_payload))
 
     async def _handle_reconnect(self, data: dict):
         session = data.get('payload', {}).get('session', {})
         new_session = Session.from_twitch(session)
         self.logger.debug(f"got request from websocket to reconnect, reconnect url: {new_session.reconnect_url}")
+        self._set_connection_state(ConnectionState.RECONNECTING)
         self._reset_timeout()
         new_connection = None
         retry = 0
@@ -568,6 +611,7 @@ class EventSubWebsocket(EventSubBase):
             await self._resubscribe()
         self._is_reconnecting = False
         self._startup_complete = True
+        self._set_connection_state(ConnectionState.READY)
 
     async def _handle_keepalive(self, data: dict):
         self.logger.debug('got session keep alive')
@@ -588,6 +632,5 @@ class EventSubWebsocket(EventSubBase):
             else:
                 if msg_id:
                     self._msg_id_history.append(msg_id)
-                t = self._callback_loop.create_task(callback['callback'](callback['event'](**_payload)))
-                t.add_done_callback(self._task_callback)
+                self._dispatch_callback(callback['callback'](callback['event'](**_payload)))
 

@@ -14,11 +14,12 @@ from enum import Enum
 
 from .type import AuthScope
 
-from typing import Union, List, Type, Optional, overload
+from typing import Union, List, Type, Optional, overload, Callable
 
 __all__ = ['first', 'limit', 'TWITCH_API_BASE_URL', 'TWITCH_AUTH_BASE_URL', 'TWITCH_CHAT_URL', 'TWITCH_EVENT_SUB_WEBSOCKET_URL',
            'build_url', 'get_uuid', 'build_scope', 'fields_to_enum', 'make_enum',
-           'enum_value_or_none', 'datetime_to_str', 'remove_none_values', 'ResultType', 'RateLimitBucket', 'RATE_LIMIT_SIZES', 'done_task_callback']
+           'enum_value_or_none', 'datetime_to_str', 'remove_none_values', 'ResultType', 'RateLimitBucket', 'RATE_LIMIT_SIZES', 'done_task_callback',
+           'submit_coroutine', 'notify_state_change']
 
 T = TypeVar('T')
 
@@ -283,3 +284,35 @@ def done_task_callback(logger: Logger, task: asyncio.Task):
     e = task.exception()
     if e is not None:
         logger.exception("Error while running callback", exc_info=e)
+
+
+def submit_coroutine(loop: asyncio.AbstractEventLoop, coroutine, *, on_done: Optional[Callable] = None):
+    """Schedule :code:`coroutine` on :code:`loop` from any thread.
+
+    Unlike :func:`asyncio.run_coroutine_threadsafe` this helper guarantees that a coroutine which could
+    not be scheduled is closed again instead of leaking a warning. This is the only supported way of
+    handing a callback to a loop that is running on a different thread.
+    """
+    try:
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+    except BaseException:
+        coroutine.close()
+        raise
+    if on_done is not None:
+        future.add_done_callback(on_done)
+    return future
+
+
+def notify_state_change(handler: Optional[Callable], state, logger: Optional[Logger] = None) -> None:
+    """Call :code:`handler(state)` while swallowing any exception it raises.
+
+    The handler only ever receives the public state value; connection data such as URLs, session IDs,
+    tokens, headers or exception bodies is never passed through here.
+    """
+    if handler is None:
+        return
+    try:
+        handler(state)
+    except BaseException:
+        if logger is not None:
+            logger.warning('state_change_handler raised an exception')

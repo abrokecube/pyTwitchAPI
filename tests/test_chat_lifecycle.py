@@ -5,6 +5,7 @@ import threading
 import pytest
 
 from twitchAPI.chat import Chat
+from twitchAPI.type import ConnectionState
 
 
 class _FakeTwitch:
@@ -17,12 +18,18 @@ def _new_chat(**attrs) -> Chat:
     chat.logger = logging.getLogger('test.chat')
     chat.twitch = _FakeTwitch()
     chat.username = 'testbot'
+    chat.no_shared_chat_messages = True
     chat._Chat__socket_thread = None
     chat._Chat__socket_loop = None
     chat._Chat__running = False
     chat._Chat__startup_complete = False
     chat._ready = False
     chat._closing = False
+    chat._join_target = []
+    chat._event_handler = {}
+    chat._callback_loop = None
+    if 'state_change_handler' in attrs:
+        chat._state_change_handler = attrs.pop('state_change_handler')
     for key, value in attrs.items():
         setattr(chat, key, value)
     return chat
@@ -184,3 +191,82 @@ def test_chat_stop_from_socket_thread_raises() -> None:
         loop_thread.join(1.0)
         loop.close()
     assert loop_thread.is_alive() is False
+
+
+# --- connection state projection ---
+
+def test_chat_connection_state_start_ready_stop() -> None:
+    states = []
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    release = threading.Event()
+    helper_started = threading.Event()
+
+    def fake_run_socket() -> None:
+        chat._Chat__socket_loop = loop
+        chat._callback_loop = loop
+        chat._Chat__startup_complete = True
+        helper_started.set()
+        release.wait(2.0)
+
+    async def short_stop() -> None:
+        release.set()
+
+    chat = _new_chat(state_change_handler=states.append)
+    chat._Chat__run_socket = fake_run_socket
+    chat._stop = short_stop
+    try:
+        chat.start()
+        assert helper_started.wait(1.0)
+
+        async def ready() -> None:
+            await chat._handle_ready({'parameters': None, 'tags': {}})
+
+        asyncio.run(ready())
+        chat.stop(timeout=1.0)
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+
+    assert loop_thread.is_alive() is False
+    assert states == [
+        ConnectionState.STARTING,
+        ConnectionState.READY,
+        ConnectionState.STOPPING,
+        ConnectionState.STOPPED,
+    ]
+
+
+def test_chat_partial_start_reports_failed() -> None:
+    states = []
+    chat = _new_chat(state_change_handler=states.append)
+    chat._Chat__run_socket = lambda: None  # socket thread dies before startup completes
+    with pytest.raises(RuntimeError):
+        chat.start()
+    assert states == [ConnectionState.STARTING, ConnectionState.FAILED]
+
+
+def test_chat_state_payloads_are_enum_only() -> None:
+    captured = []
+    chat = _new_chat(state_change_handler=captured.append)
+    chat._set_connection_state(ConnectionState.STARTING)
+    chat._set_connection_state(ConnectionState.READY)
+    assert captured == [ConnectionState.STARTING, ConnectionState.READY]
+    assert all(isinstance(state, ConnectionState) for state in captured)
+    text = repr(captured)
+    for secret in ('wss://', 'sess-1', 'Bearer', 'Authorization', 'token'):
+        assert secret not in text
+
+
+def test_chat_state_handler_exception_is_swallowed() -> None:
+    def handler(_state) -> None:
+        raise RuntimeError('handler boom token=super-secret')
+
+    chat = _new_chat(state_change_handler=handler)
+    chat._set_connection_state(ConnectionState.STARTING)
+    chat._set_connection_state(ConnectionState.READY)
+    assert chat.connection_state is ConnectionState.READY
+
