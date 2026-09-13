@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import threading
-import time
 
 import pytest
 
@@ -278,26 +277,88 @@ def test_chat_state_transitions_are_serialized() -> None:
     entered = threading.Event()
     release = threading.Event()
     calls = []
+    calls_lock = threading.Lock()
 
     def handler(state) -> None:
-        calls.append(state)
+        with calls_lock:
+            calls.append(state)
         if state is ConnectionState.READY:
             entered.set()
             release.wait(2.0)
 
     chat = _new_chat(state_change_handler=handler)
     first = threading.Thread(target=lambda: chat._set_connection_state(ConnectionState.READY))
-    first.start()
-    assert entered.wait(1.0) is True
     second = threading.Thread(target=lambda: chat._set_connection_state(ConnectionState.FAILED))
-    second.start()
-    time.sleep(0.2)
-    assert calls == [ConnectionState.READY]
-    release.set()
-    first.join(1.0)
-    second.join(1.0)
-    assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+    try:
+        first.start()
+        assert entered.wait(1.0) is True
+        assert chat.connection_state is ConnectionState.READY
+        # The handler runs outside the state lock, so a concurrent transition can update the
+        # stored state and be notified without waiting for the blocked READY handler.
+        second.start()
+        second.join(1.0)
+        assert second.is_alive() is False
+        assert chat.connection_state is ConnectionState.FAILED
+        with calls_lock:
+            assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+        # identical consecutive states must not re-notify
+        chat._set_connection_state(ConnectionState.FAILED)
+        with calls_lock:
+            assert calls.count(ConnectionState.FAILED) == 1
+    finally:
+        release.set()
+        first.join(1.0)
+        second.join(1.0)
     assert chat.connection_state is ConnectionState.FAILED
+
+
+def test_chat_state_handler_calling_stop_does_not_deadlock() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    socket_release = threading.Event()
+    reentered = threading.Event()
+    calls = []
+    errors = []
+
+    async def fake_stop() -> None:
+        socket_release.set()
+
+    def socket_body() -> None:
+        socket_release.wait(2.0)
+        # emulate __run_socket's finally surfacing the terminal state
+        chat._set_connection_state(ConnectionState.STOPPED)
+
+    socket_thread = threading.Thread(target=socket_body, daemon=True)
+
+    def handler(state) -> None:
+        calls.append(state)
+        if state is ConnectionState.READY and not reentered.is_set():
+            reentered.set()
+            try:
+                chat.stop(timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001 - recorded for the regression assertion
+                errors.append(exc)
+
+    chat = _new_chat(
+        state_change_handler=handler,
+        _Chat__running=True,
+        _Chat__socket_loop=loop,
+        _Chat__socket_thread=socket_thread,
+    )
+    chat._stop = fake_stop
+    socket_thread.start()
+    try:
+        chat._set_connection_state(ConnectionState.READY)
+        socket_thread.join(2.0)
+    finally:
+        socket_release.set()
+        socket_thread.join(1.0)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert errors == []
+    assert calls == [ConnectionState.READY, ConnectionState.STOPPING, ConnectionState.STOPPED]
 
 
 # --- reconnect and failure projection (FIX 3) ---

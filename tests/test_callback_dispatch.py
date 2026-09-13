@@ -233,8 +233,9 @@ def test_chat_dispatch_scheduling_failure_is_suppressed(caplog) -> None:
 
     with caplog.at_level(logging.WARNING, logger='test.chat.dispatch'):
         asyncio.run(scenario())
-    assert 'failed to schedule callback' in caplog.text
-    assert 'Event loop is closed' not in caplog.text
+    records = [record for record in caplog.records if 'failed to schedule callback' in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
 
 
 def test_eventsub_dispatch_scheduling_failure_is_suppressed(caplog) -> None:
@@ -253,8 +254,9 @@ def test_eventsub_dispatch_scheduling_failure_is_suppressed(caplog) -> None:
 
     with caplog.at_level(logging.WARNING, logger='test.eventsub.dispatch'):
         asyncio.run(scenario())
-    assert 'failed to schedule callback' in caplog.text
-    assert 'Event loop is closed' not in caplog.text
+    records = [record for record in caplog.records if 'failed to schedule callback' in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
 
 
 # --- done callback and state handler safety (FIX 6) ---
@@ -287,6 +289,17 @@ def test_notify_state_change_does_not_swallow_base_exceptions() -> None:
 
     with pytest.raises(KeyboardInterrupt):
         notify_state_change(handler, ConnectionState.READY, logging.getLogger('test.callback.dispatch'))
+
+
+def test_notify_state_change_logs_exception_with_traceback(caplog) -> None:
+    def handler(_state) -> None:
+        raise RuntimeError('handler boom')
+
+    with caplog.at_level(logging.WARNING, logger='test.callback.dispatch'):
+        notify_state_change(handler, ConnectionState.READY, logging.getLogger('test.callback.dispatch'))
+    records = [record for record in caplog.records if 'state_change_handler raised' in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
 
 
 def test_chat_event_callback_defaults_to_socket_loop() -> None:

@@ -598,27 +598,128 @@ def test_eventsub_state_transitions_are_serialized() -> None:
     entered = threading.Event()
     release = threading.Event()
     calls = []
+    calls_lock = threading.Lock()
 
     def handler(state) -> None:
-        calls.append(state)
+        with calls_lock:
+            calls.append(state)
         if state is ConnectionState.READY:
             entered.set()
             release.wait(2.0)
 
     client = _new_eventsub(state_change_handler=handler)
     first = threading.Thread(target=lambda: client._set_connection_state(ConnectionState.READY))
-    first.start()
-    assert entered.wait(1.0) is True
     second = threading.Thread(target=lambda: client._set_connection_state(ConnectionState.FAILED))
-    second.start()
-    time.sleep(0.2)
-    # FAILED must not be notified while the READY handler still holds the transition lock
-    assert calls == [ConnectionState.READY]
-    release.set()
-    first.join(1.0)
-    second.join(1.0)
-    assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+    try:
+        first.start()
+        assert entered.wait(1.0) is True
+        assert client.connection_state is ConnectionState.READY
+        # The handler runs outside the state lock, so a concurrent transition can update the
+        # stored state and be notified without waiting for the blocked READY handler.
+        second.start()
+        second.join(1.0)
+        assert second.is_alive() is False
+        assert client.connection_state is ConnectionState.FAILED
+        with calls_lock:
+            assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+        # identical consecutive states must not re-notify
+        client._set_connection_state(ConnectionState.FAILED)
+        with calls_lock:
+            assert calls.count(ConnectionState.FAILED) == 1
+    finally:
+        release.set()
+        first.join(1.0)
+        second.join(1.0)
     assert client.connection_state is ConnectionState.FAILED
+
+
+def test_eventsub_state_handler_calling_stop_does_not_deadlock() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    socket_release = threading.Event()
+    reentered = threading.Event()
+    calls = []
+    errors = []
+
+    async def fake_stop() -> None:
+        socket_release.set()
+
+    def socket_body() -> None:
+        socket_release.wait(2.0)
+        # emulate _run_socket's finally surfacing the terminal state
+        client._set_connection_state(ConnectionState.STOPPED)
+
+    socket_thread = threading.Thread(target=socket_body, daemon=True)
+
+    def handler(state) -> None:
+        calls.append(state)
+        if state is ConnectionState.READY and not reentered.is_set():
+            reentered.set()
+            try:
+                asyncio.run(client.stop(timeout=1.0))
+            except BaseException as exc:  # noqa: BLE001 - recorded for the regression assertion
+                errors.append(exc)
+
+    client = _new_eventsub(
+        state_change_handler=handler,
+        _running=True,
+        _socket_loop=loop,
+        _socket_thread=socket_thread,
+    )
+    client._stop = fake_stop
+    socket_thread.start()
+    try:
+        client._set_connection_state(ConnectionState.READY)
+        socket_thread.join(2.0)
+    finally:
+        socket_release.set()
+        socket_thread.join(1.0)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert errors == []
+    assert calls == [ConnectionState.READY, ConnectionState.STOPPING, ConnectionState.STOPPED]
+
+
+def _resubscription() -> dict:
+    return {
+        'sub_type': 'channel.chat.message',
+        'sub_version': '1',
+        'condition': {'broadcaster_user_id': '1', 'user_id': '2'},
+        'callback': lambda _event: None,
+        'event': lambda **kw: kw,
+    }
+
+
+def test_resubscribe_propagates_cancellation() -> None:
+    attempted = []
+
+    async def cancelled_subscribe(sub_type, sub_version, condition, callback, event, is_batching_enabled=None):
+        attempted.append(sub_type)
+        raise asyncio.CancelledError()
+
+    async def scenario() -> None:
+        client = _new_eventsub(_active_subscriptions={'sub-1': _resubscription()})
+        client._subscribe = cancelled_subscribe
+        with pytest.raises(asyncio.CancelledError):
+            await client._resubscribe()
+
+    asyncio.run(scenario())
+    assert attempted == ['channel.chat.message']
+
+
+def test_resubscribe_restores_subscriptions_on_real_error() -> None:
+    async def failing_subscribe(sub_type, sub_version, condition, callback, event, is_batching_enabled=None):
+        raise RuntimeError('boom')
+
+    async def scenario() -> None:
+        client = _new_eventsub(_active_subscriptions={'sub-1': _resubscription()})
+        client._subscribe = failing_subscribe
+        await client._resubscribe()
+        assert list(client._active_subscriptions) == ['sub-1']
+
+    asyncio.run(scenario())
 
 
 async def _wait_for_state(client, state: ConnectionState, timeout: float = 2.0) -> None:

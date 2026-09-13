@@ -318,4 +318,4 @@ def notify_state_change(handler: Optional[Callable], state, logger: Optional[Log
         handler(state)
     except Exception:
         if logger is not None:
-            logger.warning('state_change_handler raised an exception')
+            logger.warning('state_change_handler raised an exception', exc_info=True)

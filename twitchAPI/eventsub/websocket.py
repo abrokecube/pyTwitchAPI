@@ -235,11 +235,16 @@ class EventSubWebsocket(EventSubBase):
         return self._connection_state
 
     def _set_connection_state(self, state: ConnectionState) -> None:
+        """Record ``state`` and notify the handler synchronously outside the state lock.
+
+        The handler must not block or call back into the client.
+        """
         with self._state_lock:
             if state == self._connection_state:
                 return
             self._connection_state = state
-            notify_state_change(self._state_change_handler, state, self.logger)
+            handler = self._state_change_handler
+        notify_state_change(handler, state, self.logger)
 
     def _dispatch_callback(self, coroutine) -> None:
         """Run a user callback on the configured callback loop.
@@ -253,7 +258,7 @@ class EventSubWebsocket(EventSubBase):
             try:
                 submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
             except Exception:
-                self.logger.warning('failed to schedule callback on the configured event loop')
+                self.logger.warning('failed to schedule callback on the configured event loop', exc_info=True)
         else:
             task = asyncio.ensure_future(coroutine, loop=running_loop)
             task.add_done_callback(self._task_callback)
@@ -545,7 +550,7 @@ class EventSubWebsocket(EventSubBase):
         try:
             for sub in subs.values():
                 await self._subscribe(**sub)
-        except BaseException:
+        except Exception:
             self.logger.exception('exception while resubscribing')
             if not self._active_subscriptions:  # Restore old subscriptions for next reconnect
                 self._active_subscriptions = subs
