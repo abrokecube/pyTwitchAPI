@@ -172,7 +172,10 @@ See here for more info: :doc:`/modules/twitchAPI.chat`
     TARGET_CHANNEL = 'teekeks42'
 
 
-    # this will be called when the event READY is triggered, which will be on bot start
+    # This is called whenever the READY event is triggered: on initial startup and again after a
+    # reconnect, each time a session transitions into the ready state. Because it can run more than
+    # once, do not assume one-time initialization here. While a reconnect is in progress, is_ready
+    # is False and connection_state reports a non-ready state until the replacement session is ready.
     async def on_ready(ready_event: EventData):
         print('Bot is ready for work, joining channels')
         # join our target channel, if you want to join multiple, either call join for each individually

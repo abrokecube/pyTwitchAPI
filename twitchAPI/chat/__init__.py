@@ -145,7 +145,10 @@ Code example
     TARGET_CHANNEL = 'teekeks42'
 
 
-    # this will be called when the event READY is triggered, which will be on bot start
+    # This is called whenever the READY event is triggered: on initial startup and again after a
+    # reconnect, each time a session transitions into the ready state. Because it can run more than
+    # once, do not assume one-time initialization here. While a reconnect is in progress, is_ready
+    # is False and connection_state reports a non-ready state until the replacement session is ready.
     async def on_ready(ready_event: EventData):
         print('Bot is ready for work, joining channels')
         # join our target channel, if you want to join multiple, either call join for each individually
@@ -923,10 +926,11 @@ class Chat:
         The handler is invoked synchronously, outside the state lock. It may execute on the socket
         thread, and it may be called concurrently and out of order from different threads (for
         example the thread that called :meth:`start`/:meth:`stop` and the socket thread). It must
-        therefore be thread-safe and must not block. In particular it must not call the blocking
-        :meth:`stop` or :meth:`wait_closed` from the socket thread: those raise :exc:`RuntimeError`
-        rather than join or stop the socket thread from itself. If the handler observes a last state
-        other than the one it expected, :attr:`connection_state` is the source of truth.
+        therefore be thread-safe and must not block. In particular it must not perform shutdown work
+        on the socket thread: the synchronous :meth:`stop` and :meth:`wait_closed` raise
+        :exc:`RuntimeError` when called on that thread, and they must never be used to join or stop
+        the socket thread from itself. If the handler observes a last state other than the one it
+        expected, :attr:`connection_state` is the source of truth.
         """
         with self._state_lock:
             if state == self._connection_state:

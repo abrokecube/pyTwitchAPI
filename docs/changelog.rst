@@ -34,9 +34,22 @@ Latest Version
       - "Channel Points Automatic Reward Redemption v2" :const:`~twitchAPI.eventsub.base.EventSubBase.listen_channel_points_automatic_reward_redemption_add_v2()`
 
     - Fixed potentially targeting the wrong access token depending on transport and available tokens
+    - Added :const:`~twitchAPI.eventsub.websocket.EventSubWebsocket.is_running`, :const:`~twitchAPI.eventsub.websocket.EventSubWebsocket.is_ready` and :const:`~twitchAPI.eventsub.websocket.EventSubWebsocket.wait_closed()`
+    - :const:`~twitchAPI.eventsub.websocket.EventSubWebsocket.stop()` is now bounded by an optional ``timeout``
+    - Added :const:`~twitchAPI.type.ConnectionState`, :const:`~twitchAPI.eventsub.websocket.EventSubWebsocket.connection_state` and a ``state_change_handler`` to observe connection state transitions
+    - Subscription responses are now strictly validated before callbacks are registered
+    - Message-ID based deduplication is now bounded
+
+    **Chat**
+
+    - Added :const:`~twitchAPI.chat.Chat.is_running`, :const:`~twitchAPI.chat.Chat.is_ready` and :const:`~twitchAPI.chat.Chat.wait_closed()`
+    - :const:`~twitchAPI.chat.Chat.stop()` is now bounded by an optional ``timeout``
+    - Added :const:`~twitchAPI.type.ConnectionState`, :const:`~twitchAPI.chat.Chat.connection_state` and a ``state_change_handler`` to observe connection state transitions
+    - :const:`~twitchAPI.type.ChatEvent.READY` is now emitted on each transition into the ready state, including after a reconnect
 
     **Other**
 
+    - Added thread-safe cross-event-loop dispatch for connection state callbacks
     - Improved type hints all over the library
     - Fixed AttributeError in :const:`TwitchObject.__repr__()` for unset attributes
 
