@@ -3,6 +3,7 @@
 Helper functions
 ----------------"""
 import asyncio
+import concurrent.futures
 import datetime
 import logging
 import time
@@ -279,8 +280,10 @@ RATE_LIMIT_SIZES = {
 }
 
 
-def done_task_callback(logger: Logger, task: asyncio.Task):
+def done_task_callback(logger: Logger, task: Union[asyncio.Future, concurrent.futures.Future]):
     """helper function used as a asyncio task done callback"""
+    if task.cancelled():
+        return
     e = task.exception()
     if e is not None:
         logger.exception("Error while running callback", exc_info=e)
@@ -313,6 +316,6 @@ def notify_state_change(handler: Optional[Callable], state, logger: Optional[Log
         return
     try:
         handler(state)
-    except BaseException:
+    except Exception:
         if logger is not None:
             logger.warning('state_change_handler raised an exception')

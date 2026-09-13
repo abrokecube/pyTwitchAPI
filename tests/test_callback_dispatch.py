@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import logging
 import threading
 from collections import deque
@@ -8,8 +9,8 @@ import pytest
 
 from twitchAPI.chat import Chat
 from twitchAPI.eventsub.websocket import EventSubWebsocket
-from twitchAPI.helper import done_task_callback, submit_coroutine
-from twitchAPI.type import ChatEvent
+from twitchAPI.helper import done_task_callback, notify_state_change, submit_coroutine
+from twitchAPI.type import ChatEvent, ConnectionState
 
 
 def _run_loop_on_thread() -> tuple:
@@ -101,6 +102,8 @@ def _new_chat(**attrs) -> Chat:
     chat._command_middleware = []
     chat._command_specific_middleware = {}
     chat._callback_loop = None
+    chat._configured_callback_loop = None
+    chat._state_lock = threading.RLock()
     chat._task_callback = partial(done_task_callback, chat.logger)
     for key, value in attrs.items():
         setattr(chat, key, value)
@@ -138,6 +141,154 @@ def test_chat_event_callback_runs_on_configured_callback_loop() -> None:
     assert observed['thread_id'] == callback_thread.ident
 
 
+# --- callback loop re-derivation across restart (FIX 4) ---
+
+async def _noop(*_args, **_kwargs) -> None:
+    return None
+
+
+async def _drain_cancelled(tasks) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_chat_callback_loop_is_recomputed_on_restart() -> None:
+    stale_loop = asyncio.new_event_loop()
+    stale_loop.close()
+
+    chat = _new_chat(_configured_callback_loop=None, _callback_loop=stale_loop)
+    chat._Chat__connect = _noop
+    chat._Chat__task_receive = _noop
+    chat._Chat__task_startup = _noop
+    chat._keep_loop_alive = _noop
+    chat._Chat__run_socket()
+    socket_loop = chat._Chat__socket_loop
+    try:
+        assert chat._callback_loop is socket_loop
+        assert chat._callback_loop is not stale_loop
+    finally:
+        socket_loop.run_until_complete(_drain_cancelled(chat._Chat__tasks))
+        socket_loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_eventsub_callback_loop_is_recomputed_on_restart() -> None:
+    stale_loop = asyncio.new_event_loop()
+    stale_loop.close()
+
+    client = _new_eventsub(_configured_callback_loop=None, _callback_loop=stale_loop)
+    client._connect = _noop
+    client._task_receive = _noop
+    client._task_reconnect_handler = _noop
+    client._keep_loop_alive = _noop
+    client._run_socket()
+    socket_loop = client._socket_loop
+    try:
+        assert client._callback_loop is socket_loop
+        assert client._callback_loop is not stale_loop
+    finally:
+        socket_loop.run_until_complete(_drain_cancelled(client._tasks))
+        socket_loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_chat_user_supplied_callback_loop_is_preserved() -> None:
+    user_loop = asyncio.new_event_loop()
+    stale_loop = asyncio.new_event_loop()
+    stale_loop.close()
+    try:
+        chat = _new_chat(_configured_callback_loop=user_loop, _callback_loop=stale_loop)
+        chat._Chat__connect = _noop
+        chat._Chat__task_receive = _noop
+        chat._Chat__task_startup = _noop
+        chat._keep_loop_alive = _noop
+        chat._Chat__run_socket()
+        socket_loop = chat._Chat__socket_loop
+        try:
+            assert chat._callback_loop is user_loop
+        finally:
+            socket_loop.run_until_complete(_drain_cancelled(chat._Chat__tasks))
+            socket_loop.close()
+            asyncio.set_event_loop(None)
+    finally:
+        user_loop.close()
+
+
+# --- scheduling failures must not escape the socket loop (FIX 5) ---
+
+def test_chat_dispatch_scheduling_failure_is_suppressed(caplog) -> None:
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    async def scenario() -> None:
+        chat = _new_chat(_callback_loop=closed_loop, _configured_callback_loop=closed_loop)
+
+        async def callback() -> None:
+            return None
+
+        coroutine = callback()
+        chat._dispatch_callback(coroutine)
+        assert coroutine.cr_frame is None
+
+    with caplog.at_level(logging.WARNING, logger='test.chat.dispatch'):
+        asyncio.run(scenario())
+    assert 'failed to schedule callback' in caplog.text
+    assert 'Event loop is closed' not in caplog.text
+
+
+def test_eventsub_dispatch_scheduling_failure_is_suppressed(caplog) -> None:
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    async def scenario() -> None:
+        client = _new_eventsub(_callback_loop=closed_loop, _configured_callback_loop=closed_loop)
+
+        async def callback() -> None:
+            return None
+
+        coroutine = callback()
+        client._dispatch_callback(coroutine)
+        assert coroutine.cr_frame is None
+
+    with caplog.at_level(logging.WARNING, logger='test.eventsub.dispatch'):
+        asyncio.run(scenario())
+    assert 'failed to schedule callback' in caplog.text
+    assert 'Event loop is closed' not in caplog.text
+
+
+# --- done callback and state handler safety (FIX 6) ---
+
+def test_done_task_callback_ignores_cancelled_concurrent_future() -> None:
+    logger = logging.getLogger('test.callback.dispatch')
+    future = concurrent.futures.Future()
+    assert future.cancel() is True
+    done_task_callback(logger, future)
+
+
+def test_done_task_callback_ignores_cancelled_asyncio_task() -> None:
+    async def scenario() -> None:
+        async def never() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.ensure_future(never())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        done_task_callback(logging.getLogger('test.callback.dispatch'), task)
+
+    asyncio.run(scenario())
+
+
+def test_notify_state_change_does_not_swallow_base_exceptions() -> None:
+    def handler(_state) -> None:
+        raise KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt):
+        notify_state_change(handler, ConnectionState.READY, logging.getLogger('test.callback.dispatch'))
+
+
 def test_chat_event_callback_defaults_to_socket_loop() -> None:
     async def scenario() -> None:
         observed = {}
@@ -169,6 +320,8 @@ def _new_eventsub(**attrs) -> EventSubWebsocket:
     client._connection = None
     client._session = None
     client._callback_loop = None
+    client._configured_callback_loop = None
+    client._state_lock = threading.RLock()
     client.connection_url = 'wss://example.invalid/ws'
     client._task_callback = lambda _task: None
     client._reset_timeout = lambda: None

@@ -205,7 +205,9 @@ class EventSubWebsocket(EventSubBase):
         self._connection = None
         self._session = None
         self._callback_loop = callback_loop
+        self._configured_callback_loop = callback_loop
         self._state_change_handler = state_change_handler
+        self._state_lock = threading.RLock()
         self._connection_state = ConnectionState.STOPPED
         self._is_reconnecting: bool = False
         self._active_subscriptions = {}
@@ -233,10 +235,11 @@ class EventSubWebsocket(EventSubBase):
         return self._connection_state
 
     def _set_connection_state(self, state: ConnectionState) -> None:
-        if state == self._connection_state:
-            return
-        self._connection_state = state
-        notify_state_change(self._state_change_handler, state, self.logger)
+        with self._state_lock:
+            if state == self._connection_state:
+                return
+            self._connection_state = state
+            notify_state_change(self._state_change_handler, state, self.logger)
 
     def _dispatch_callback(self, coroutine) -> None:
         """Run a user callback on the configured callback loop.
@@ -247,7 +250,10 @@ class EventSubWebsocket(EventSubBase):
         """
         running_loop = asyncio.get_running_loop()
         if self._callback_loop is not None and self._callback_loop is not running_loop:
-            submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
+            try:
+                submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
+            except Exception:
+                self.logger.warning('failed to schedule callback on the configured event loop')
         else:
             task = asyncio.ensure_future(coroutine, loop=running_loop)
             task.add_done_callback(self._task_callback)
@@ -412,8 +418,7 @@ class EventSubWebsocket(EventSubBase):
 
     def _run_socket(self):
         self._socket_loop = asyncio.new_event_loop()
-        if self._callback_loop is None:
-            self._callback_loop = self._socket_loop
+        self._callback_loop = self._configured_callback_loop if self._configured_callback_loop is not None else self._socket_loop
         asyncio.set_event_loop(self._socket_loop)
 
         try:
@@ -495,6 +500,10 @@ class EventSubWebsocket(EventSubBase):
                         self._connection = self._reconnect.connection
                         self.active_session = self._reconnect.session
                         self._reconnect = None
+                        self._is_reconnecting = False
+                        if self._active_subscriptions:
+                            await self._resubscribe()
+                        self._set_connection_state(ConnectionState.READY)
                         self.logger.debug("websocket session_reconnect completed")
                         continue
                 elif message.type == aiohttp.WSMsgType.CLOSED:

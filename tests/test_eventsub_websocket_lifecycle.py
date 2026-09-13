@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections import deque
 from types import SimpleNamespace
 
@@ -34,6 +35,8 @@ def _new_eventsub(**attrs) -> EventSubWebsocket:
     client._connection = None
     client._session = None
     client._callback_loop = None
+    client._configured_callback_loop = None
+    client._state_lock = threading.RLock()
     client.connection_url = 'wss://example.invalid/ws'
     client._is_reconnecting = False
     client._reconnect_timeout = None
@@ -395,7 +398,10 @@ class _FakeConnection:
         self._queue: asyncio.Queue = asyncio.Queue()
 
     async def close(self) -> None:
-        self.closed = True
+        if not self.closed:
+            self.closed = True
+            # emulate aiohttp waking a pending receive with a CLOSING message
+            self._queue.put_nowait(_FakeWSMessage(aiohttp.WSMsgType.CLOSING, ''))
 
     async def receive(self, timeout=None):
         return await self._queue.get()
@@ -588,8 +594,53 @@ def _reconnect_request() -> dict:
     }
 
 
-def test_eventsub_reconnect_handover_deduplicates_redelivered_message() -> None:
+def test_eventsub_state_transitions_are_serialized() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def handler(state) -> None:
+        calls.append(state)
+        if state is ConnectionState.READY:
+            entered.set()
+            release.wait(2.0)
+
+    client = _new_eventsub(state_change_handler=handler)
+    first = threading.Thread(target=lambda: client._set_connection_state(ConnectionState.READY))
+    first.start()
+    assert entered.wait(1.0) is True
+    second = threading.Thread(target=lambda: client._set_connection_state(ConnectionState.FAILED))
+    second.start()
+    time.sleep(0.2)
+    # FAILED must not be notified while the READY handler still holds the transition lock
+    assert calls == [ConnectionState.READY]
+    release.set()
+    first.join(1.0)
+    second.join(1.0)
+    assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+    assert client.connection_state is ConnectionState.FAILED
+
+
+async def _wait_for_state(client, state: ConnectionState, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while client.connection_state is not state:
+        if time.monotonic() > deadline:
+            raise AssertionError(f'timed out waiting for {state}, currently {client.connection_state}')
+        await asyncio.sleep(0.005)
+
+
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError('timed out waiting for condition')
+        await asyncio.sleep(0.005)
+
+
+def test_eventsub_reconnect_handover_emits_ready_and_dedupes_across_swap() -> None:
     delivered = []
+    states = []
+    resubscribed = []
 
     async def callback(event) -> None:
         delivered.append(event)
@@ -597,7 +648,15 @@ def test_eventsub_reconnect_handover_deduplicates_redelivered_message() -> None:
     async def scenario() -> None:
         old_connection = _FakeConnection()
         new_connection = _FakeConnection()
+        subscription = {
+            'sub_type': 'channel.chat.message',
+            'sub_version': '1',
+            'condition': {'broadcaster_user_id': '1', 'user_id': '2'},
+            'callback': callback,
+            'event': lambda **kw: kw,
+        }
         client = _new_eventsub(
+            state_change_handler=states.append,
             _callbacks={'sub-1': {'id': 'sub-1', 'callback': callback, 'active': True, 'event': lambda **kw: kw}},
             _msg_id_history=deque(maxlen=5),
             _callback_loop=asyncio.get_running_loop(),
@@ -609,35 +668,69 @@ def test_eventsub_reconnect_handover_deduplicates_redelivered_message() -> None:
                 reconnect_url=None,
             ),
             _session=_HandoverSession(new_connection),
-            _active_subscriptions={},
-            _is_reconnecting=True,
+            _active_subscriptions={'sub-1': subscription},
+            _is_reconnecting=False,
             _reset_timeout=lambda: None,
+            _running=True,
         )
 
-        reconnect_task = asyncio.ensure_future(client._handle_reconnect(_reconnect_request()))
-        await asyncio.sleep(0)
-        # the replacement welcome is delayed, so the handover is still pending
-        assert reconnect_task.done() is False
+        async def fake_subscribe(sub_type, sub_version, condition, callback, event, is_batching_enabled=None):
+            resubscribed.append((sub_type, client.active_session.id))
+            client._active_subscriptions['sub-1'] = {
+                'sub_type': sub_type,
+                'sub_version': sub_version,
+                'condition': condition,
+                'callback': callback,
+                'event': event,
+            }
+            return 'sub-1'
 
-        # the old socket must stay consumable until the replacement session is ready
-        await client._handle_notification(_notification('m-handover'))
-        await _drain_tasks()
-        assert len(delivered) == 1
+        client._subscribe = fake_subscribe
 
-        # now the replacement welcome arrives and the swap happens
-        new_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_welcome('sess-new'))))
-        await asyncio.wait_for(reconnect_task, 1.0)
+        client._set_connection_state(ConnectionState.STARTING)
+        receive_task = asyncio.ensure_future(client._task_receive())
+        try:
+            old_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_welcome('sess-old'))))
+            await _wait_for_state(client, ConnectionState.READY)
 
-        client._connection = client._reconnect.connection
-        client.active_session = client._reconnect.session
-        client._reconnect = None
-        await client._handle_welcome(_welcome('sess-new'))
+            old_connection.push(
+                _FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_notification('m-handover')))
+            )
+            await _wait_until(lambda: len(delivered) == 1)
 
-        # the replacement redelivers the same message id -> exactly one callback total
-        await client._handle_notification(_notification('m-handover'))
-        await _drain_tasks()
-        assert len(delivered) == 1
+            old_connection.push(
+                _FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_reconnect_request()))
+            )
+            await _wait_for_state(client, ConnectionState.RECONNECTING)
+
+            # the replacement welcome is delayed: the old socket must stay in place and consumable
+            assert client._connection is old_connection
+            assert client._reconnect is None
+
+            new_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_welcome('sess-new'))))
+            await _wait_for_state(client, ConnectionState.READY)
+
+            assert client.active_session.id == 'sess-new'
+            assert client._connection is new_connection
+            assert resubscribed == [('channel.chat.message', 'sess-new')]
+
+            # the replacement redelivers the same message id -> exactly one callback total
+            new_connection.push(
+                _FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_notification('m-handover')))
+            )
+            await _drain_tasks()
+            await asyncio.sleep(0.01)
+            assert len(delivered) == 1
+        finally:
+            receive_task.cancel()
+            await asyncio.gather(receive_task, return_exceptions=True)
 
     asyncio.run(scenario())
+    assert states == [
+        ConnectionState.STARTING,
+        ConnectionState.READY,
+        ConnectionState.RECONNECTING,
+        ConnectionState.READY,
+    ]
 
 

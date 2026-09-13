@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 
 import pytest
 
@@ -28,6 +29,8 @@ def _new_chat(**attrs) -> Chat:
     chat._join_target = []
     chat._event_handler = {}
     chat._callback_loop = None
+    chat._configured_callback_loop = None
+    chat._state_lock = threading.RLock()
     if 'state_change_handler' in attrs:
         chat._state_change_handler = attrs.pop('state_change_handler')
     for key, value in attrs.items():
@@ -269,4 +272,69 @@ def test_chat_state_handler_exception_is_swallowed() -> None:
     chat._set_connection_state(ConnectionState.STARTING)
     chat._set_connection_state(ConnectionState.READY)
     assert chat.connection_state is ConnectionState.READY
+
+
+def test_chat_state_transitions_are_serialized() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def handler(state) -> None:
+        calls.append(state)
+        if state is ConnectionState.READY:
+            entered.set()
+            release.wait(2.0)
+
+    chat = _new_chat(state_change_handler=handler)
+    first = threading.Thread(target=lambda: chat._set_connection_state(ConnectionState.READY))
+    first.start()
+    assert entered.wait(1.0) is True
+    second = threading.Thread(target=lambda: chat._set_connection_state(ConnectionState.FAILED))
+    second.start()
+    time.sleep(0.2)
+    assert calls == [ConnectionState.READY]
+    release.set()
+    first.join(1.0)
+    second.join(1.0)
+    assert calls == [ConnectionState.READY, ConnectionState.FAILED]
+    assert chat.connection_state is ConnectionState.FAILED
+
+
+# --- reconnect and failure projection (FIX 3) ---
+
+async def _noop(*_args, **_kwargs) -> None:
+    return None
+
+
+async def _drain_cancelled(tasks) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_chat_reconnect_reports_reconnecting() -> None:
+    states = []
+    chat = _new_chat(state_change_handler=states.append)
+    chat._Chat__connect = _noop
+    chat._Chat__task_startup = _noop
+    asyncio.run(chat._handle_base_reconnect())
+    assert states == [ConnectionState.RECONNECTING]
+
+
+def test_chat_socket_exit_without_closing_reports_failed() -> None:
+    states = []
+    chat = _new_chat(state_change_handler=states.append, _closing=False)
+    chat._Chat__connect = _noop
+    chat._Chat__task_receive = _noop
+    chat._Chat__task_startup = _noop
+    chat._keep_loop_alive = _noop
+    chat._Chat__run_socket()
+    socket_loop = chat._Chat__socket_loop
+    try:
+        assert states == [ConnectionState.FAILED]
+        assert chat.connection_state is ConnectionState.FAILED
+    finally:
+        socket_loop.run_until_complete(_drain_cancelled(chat._Chat__tasks))
+        socket_loop.close()
+        asyncio.set_event_loop(None)
 

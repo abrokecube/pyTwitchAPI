@@ -611,7 +611,9 @@ class Chat:
         self.ping_jitter: int = 4
         """Jitter in seconds for ping messages. This should usually not be changed."""
         self._callback_loop = callback_loop
+        self._configured_callback_loop = callback_loop
         self._state_change_handler = state_change_handler
+        self._state_lock = threading.RLock()
         self._connection_state = ConnectionState.STOPPED
         self.no_message_reset_time: Optional[float] = no_message_reset_time
         self.no_shared_chat_messages: bool = no_shared_chat_messages
@@ -919,10 +921,11 @@ class Chat:
         return self._connection_state
 
     def _set_connection_state(self, state: ConnectionState) -> None:
-        if state == self._connection_state:
-            return
-        self._connection_state = state
-        notify_state_change(self._state_change_handler, state, self.logger)
+        with self._state_lock:
+            if state == self._connection_state:
+                return
+            self._connection_state = state
+            notify_state_change(self._state_change_handler, state, self.logger)
 
     def _dispatch_callback(self, coroutine) -> None:
         """Run a user callback on the configured callback loop.
@@ -933,7 +936,10 @@ class Chat:
         """
         running_loop = asyncio.get_running_loop()
         if self._callback_loop is not None and self._callback_loop is not running_loop:
-            submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
+            try:
+                submit_coroutine(self._callback_loop, coroutine, on_done=self._task_callback)
+            except Exception:
+                self.logger.warning('failed to schedule callback on the configured event loop')
         else:
             task = asyncio.ensure_future(coroutine, loop=running_loop)
             task.add_done_callback(self._task_callback)
@@ -979,8 +985,7 @@ class Chat:
 
     def __run_socket(self):
         self.__socket_loop = asyncio.new_event_loop()
-        if self._callback_loop is None:
-            self._callback_loop = self.__socket_loop
+        self._callback_loop = self._configured_callback_loop if self._configured_callback_loop is not None else self.__socket_loop
         asyncio.set_event_loop(self.__socket_loop)
 
         try:
@@ -996,6 +1001,8 @@ class Chat:
         finally:
             if self._closing:
                 self._set_connection_state(ConnectionState.STOPPED)
+            else:
+                self._set_connection_state(ConnectionState.FAILED)
 
     async def _send_message(self, message: str):
         self.logger.debug(f'> "{message}"')
@@ -1065,6 +1072,7 @@ class Chat:
             return
 
     async def _handle_base_reconnect(self):
+        self._set_connection_state(ConnectionState.RECONNECTING)
         await self.__connect(is_startup=False)
         await self.__task_startup()
 
