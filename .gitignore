@@ -10,6 +10,5 @@ MANIFEST
 /docs/_build/
 /chat_example.py
 requirements_dev.txt
-/tests/
 pytest.ini
 Makefile

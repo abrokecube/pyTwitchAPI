@@ -84,7 +84,7 @@ import threading
 from asyncio import CancelledError
 from dataclasses import dataclass
 from functools import partial
-from time import sleep
+from time import sleep, monotonic
 from typing import Optional, List, Dict, Callable, Awaitable
 
 import aiohttp
@@ -101,6 +101,12 @@ from twitchAPI.twitch import Twitch
 from ..helper import TWITCH_EVENT_SUB_WEBSOCKET_URL, done_task_callback
 from ..type import AuthType, UnauthorizedException, TwitchBackendException, EventSubSubscriptionConflict, EventSubSubscriptionError, \
     TwitchAuthorizationException
+
+
+def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - monotonic())
 
 
 @dataclass
@@ -174,6 +180,31 @@ class EventSubWebsocket(EventSubBase):
         self.reconnect_delay_steps: List[int] = [0, 1, 2, 4, 8, 16, 32, 64, 128]
         """Time in seconds between reconnect attempts"""
 
+    @property
+    def is_running(self) -> bool:
+        """Returns :code:`True` while the socket thread has been started and not yet stopped."""
+        return self._running
+
+    @property
+    def is_ready(self) -> bool:
+        """Returns :code:`True` once the EventSub session is connected and ready."""
+        return self._ready
+
+    def wait_closed(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the socket thread to terminate.
+
+        :param timeout: Maximum number of seconds to wait. :code:`None` waits forever.
+        :returns: :code:`True` if there is no socket thread or it has terminated, :code:`False` on timeout.
+        :raises RuntimeError: if called from the socket thread itself
+        """
+        thread = self._socket_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            raise RuntimeError('socket thread cannot wait for itself')
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def start(self):
         """Starts the EventSub client
 
@@ -193,23 +224,44 @@ class EventSubWebsocket(EventSubBase):
         self._active_subscriptions = {}
         self._socket_thread.start()
         while not self._startup_complete:
+            if not self._socket_thread.is_alive():
+                # startup failed, make sure we do not leave a half started client behind
+                self._socket_thread.join()
+                self._socket_thread = None
+                self._running = False
+                self._ready = False
+                raise RuntimeError('EventSubWebsocket socket thread died during startup')
             sleep(0.01)
         self.logger.debug('EventSubWebsocket started up!')
 
-    async def stop(self):
+    async def stop(self, timeout: Optional[float] = 5.0):
         """Stops the EventSub client
 
-        :raises RuntimeError: If EventSub is not running
+        Calling this when the client is not running is a no-op.
+
+        :param timeout: Maximum number of seconds to wait for the socket thread to stop. :code:`None` waits forever.
+        :raises TimeoutError: if the socket thread is still alive after :code:`timeout` seconds
         """
         if not self._running:
-            raise RuntimeError('EventSubWebsocket is not running')
+            return
         self.logger.debug('stopping websocket EventSub...')
         self._startup_complete = False
         self._running = False
         self._ready = False
+        deadline = None if timeout is None else monotonic() + timeout
         if self._socket_loop is not None:
             f = asyncio.run_coroutine_threadsafe(self._stop(), self._socket_loop)
-            f.result()
+            try:
+                f.result(timeout=_remaining_timeout(deadline))
+            except TimeoutError:
+                f.cancel()
+                raise TimeoutError('Twitch socket thread did not stop')
+        thread = self._socket_thread
+        if thread is not None:
+            thread.join(_remaining_timeout(deadline))
+            if thread.is_alive():
+                raise TimeoutError('Twitch socket thread did not stop')
+        self._socket_thread = None
 
     def _get_transport(self) -> dict:
         return {

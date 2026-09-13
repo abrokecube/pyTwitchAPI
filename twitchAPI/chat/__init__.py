@@ -226,7 +226,7 @@ import threading
 from asyncio import CancelledError
 from functools import partial
 from logging import getLogger, Logger
-from time import sleep
+from time import sleep, monotonic
 import aiohttp
 import random
 
@@ -243,6 +243,12 @@ if TYPE_CHECKING:
 
 __all__ = ['Chat', 'ChatUser', 'EventData', 'ChatMessage', 'ChatCommand', 'ChatSub', 'ChatRoom', 'ChatEvent', 'RoomStateChangeEvent',
            'JoinEvent', 'JoinedEvent', 'LeftEvent', 'ClearChatEvent', 'WhisperEvent', 'MessageDeletedEvent', 'NoticeEvent', 'HypeChat']
+
+
+def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - monotonic())
 
 
 class ChatUser:
@@ -826,24 +832,46 @@ class Chat:
         self.__running = True
         self.__socket_thread.start()
         while not self.__startup_complete:
+            if not self.__socket_thread.is_alive():
+                # startup failed, make sure we do not leave a half started client behind
+                self.__socket_thread.join()
+                self.__socket_thread = None
+                self.__running = False
+                self._ready = False
+                raise RuntimeError('Chat socket thread died during startup')
             sleep(0.01)
         self.logger.debug('chat started up!')
 
-    def stop(self) -> None:
+    def stop(self, timeout: Optional[float] = 5.0) -> None:
         """
         Stop the Chat Client
 
-        :raises RuntimeError: if the client is not running
+        Calling this when the client is not running is a no-op.
+
+        :param timeout: Maximum number of seconds to wait for the socket thread to stop. :code:`None` waits forever.
+        :raises TimeoutError: if the socket thread is still alive after :code:`timeout` seconds
         """
 
         if not self.__running:
-            raise RuntimeError('not running')
+            return
         self.logger.debug('stopping chat...')
         self.__startup_complete = False
         self.__running = False
         self._ready = False
-        f = asyncio.run_coroutine_threadsafe(self._stop(), self.__socket_loop)
-        f.result()
+        deadline = None if timeout is None else monotonic() + timeout
+        if self.__socket_loop is not None:
+            f = asyncio.run_coroutine_threadsafe(self._stop(), self.__socket_loop)
+            try:
+                f.result(timeout=_remaining_timeout(deadline))
+            except TimeoutError:
+                f.cancel()
+                raise TimeoutError('Twitch socket thread did not stop')
+        thread = self.__socket_thread
+        if thread is not None:
+            thread.join(_remaining_timeout(deadline))
+            if thread.is_alive():
+                raise TimeoutError('Twitch socket thread did not stop')
+        self.__socket_thread = None
 
     async def _stop(self):
         await self.__connection.close()
@@ -857,6 +885,31 @@ class Chat:
         self._room_join_locks = []
         self._room_leave_locks = []
         self._closing = True
+
+    @property
+    def is_running(self) -> bool:
+        """Returns :code:`True` while the chat socket thread has been started and not yet stopped."""
+        return self.__running
+
+    @property
+    def is_ready(self) -> bool:
+        """Returns True if the chat bot is ready to join channels and/or receive events"""
+        return self._ready
+
+    def wait_closed(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the chat socket thread to terminate.
+
+        :param timeout: Maximum number of seconds to wait. :code:`None` waits forever.
+        :returns: :code:`True` if there is no socket thread or it has terminated, :code:`False` on timeout.
+        :raises RuntimeError: if called from the socket thread itself
+        """
+        thread = self.__socket_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            raise RuntimeError('socket thread cannot wait for itself')
+        thread.join(timeout)
+        return not thread.is_alive()
 
     async def __connect(self, is_startup=False):
         if is_startup:
@@ -1256,10 +1309,6 @@ class Chat:
             return False
         return not self.__connection.closed
 
-    def is_ready(self) -> bool:
-        """Returns True if the chat bot is ready to join channels and/or receive events"""
-        return self._ready
-
     def is_mod(self, room: CHATROOM_TYPE) -> bool:
         """Check if chat bot is a mod in a channel
 
@@ -1342,7 +1391,7 @@ class Chat:
         :param message: the message to send
         :raises ValueError: if bot is not ready
         """
-        if not self.is_ready():
+        if not self.is_ready:
             raise ValueError('can\'t send message: bot not ready')
         while not self.is_connected():
             await asyncio.sleep(0.1)
@@ -1361,7 +1410,7 @@ class Chat:
         :raises ValueError: if message is empty or room is not given
         :raises ValueError: if bot is not ready
         """
-        if not self.is_ready():
+        if not self.is_ready:
             raise ValueError('can\'t send message: bot not ready')
         while not self.is_connected():
             await asyncio.sleep(0.1)
