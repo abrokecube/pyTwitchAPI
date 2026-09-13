@@ -110,6 +110,35 @@ def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
     return max(0.0, deadline - monotonic())
 
 
+def _validate_subscription_response(
+    *,
+    status: int,
+    payload: dict,
+    requested_type: str,
+    requested_version: str,
+    session_id: str,
+) -> dict:
+    data = payload.get('data')
+    if status != 202 or not isinstance(data, list) or len(data) != 1:
+        raise EventSubSubscriptionError('invalid subscription response')
+    item = data[0]
+    transport = item.get('transport') if isinstance(item, dict) else None
+    valid = (
+        isinstance(item, dict)
+        and item.get('status') == 'enabled'
+        and item.get('type') == requested_type
+        and item.get('version') == requested_version
+        and isinstance(item.get('id'), str) and bool(item['id'])
+        and isinstance(item.get('cost'), int) and item['cost'] >= 0
+        and isinstance(transport, dict)
+        and transport.get('method') == 'websocket'
+        and transport.get('session_id') == session_id
+    )
+    if not valid:
+        raise EventSubSubscriptionError('invalid subscription response')
+    return item
+
+
 @dataclass
 class Session:
     id: str
@@ -297,7 +326,14 @@ class EventSubWebsocket(EventSubBase):
             if error.lower() == 'conflict':
                 raise EventSubSubscriptionConflict(result.get('message', ''))
             raise EventSubSubscriptionError(result.get('message'))
-        sub_id = result['data'][0]['id']
+        sub = _validate_subscription_response(
+            status=r_data.status,
+            payload=result,
+            requested_type=sub_type,
+            requested_version=sub_version,
+            session_id=self.active_session.id
+        )
+        sub_id = sub['id']
         self.logger.debug(f'subscription for {sub_type} version {sub_version} with condition {condition} has id {sub_id}')
         self._add_callback(sub_id, callback, event)
         self._callbacks[sub_id]['active'] = True
@@ -547,9 +583,11 @@ class EventSubWebsocket(EventSubBase):
             self.logger.error(f'received event for unknown subscription with ID {sub_id}')
         else:
             msg_id = _payload['metadata'].get('message_id')
-            if msg_id is not None and msg_id in self._msg_id_history:
+            if msg_id and msg_id in self._msg_id_history:
                 self.logger.warning(f'got message with duplicate id {msg_id}! Discarding message')
             else:
+                if msg_id:
+                    self._msg_id_history.append(msg_id)
                 t = self._callback_loop.create_task(callback['callback'](callback['event'](**_payload)))
                 t.add_done_callback(self._task_callback)
 
