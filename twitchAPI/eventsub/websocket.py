@@ -229,6 +229,7 @@ class EventSubWebsocket(EventSubBase):
                 # startup failed, make sure we do not leave a half started client behind
                 self._socket_thread.join()
                 self._socket_thread = None
+                self._socket_loop = None
                 self._running = False
                 self._ready = False
                 raise RuntimeError('EventSubWebsocket socket thread died during startup')
@@ -245,6 +246,8 @@ class EventSubWebsocket(EventSubBase):
         """
         if not self._running:
             return
+        if self._socket_thread is threading.current_thread():
+            raise RuntimeError('socket thread cannot stop itself')
         self.logger.debug('stopping websocket EventSub...')
         self._startup_complete = False
         self._running = False
@@ -263,6 +266,7 @@ class EventSubWebsocket(EventSubBase):
             if thread.is_alive():
                 raise TimeoutError('Twitch socket thread did not stop')
         self._socket_thread = None
+        self._socket_loop = None
 
     def _get_transport(self) -> dict:
         return {

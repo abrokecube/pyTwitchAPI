@@ -121,3 +121,66 @@ def test_chat_stop_bounds_socket_stop_future() -> None:
             loop_thread.join(1.0)
             loop.close()
     assert loop_thread.is_alive() is False
+
+
+def test_chat_stop_clears_socket_loop_on_success() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    release = threading.Event()
+    helper_started = threading.Event()
+
+    def socket_helper() -> None:
+        helper_started.set()
+        release.wait(2.0)
+
+    helper = threading.Thread(target=socket_helper)
+    helper.start()
+    assert helper_started.wait(1.0)
+
+    async def short_stop() -> None:
+        release.set()
+
+    chat = _new_chat(_Chat__running=True, _Chat__socket_loop=loop, _Chat__socket_thread=helper)
+    chat._stop = short_stop
+    try:
+        chat.stop(timeout=1.0)
+        assert chat._Chat__socket_loop is None
+        assert chat._Chat__socket_thread is None
+        assert chat.is_running is False
+    finally:
+        release.set()
+        helper.join(1.0)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert helper.is_alive() is False
+    assert loop_thread.is_alive() is False
+
+
+def test_chat_stop_from_socket_thread_raises() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    captured = {}
+    done = threading.Event()
+
+    def invoke_stop() -> None:
+        try:
+            chat.stop(timeout=0.05)
+        except BaseException as exc:  # noqa: BLE001 - inspect deliberate error
+            captured['exc'] = exc
+        finally:
+            done.set()
+
+    chat = _new_chat(_Chat__running=True, _Chat__socket_loop=loop, _Chat__socket_thread=loop_thread)
+    try:
+        loop.call_soon_threadsafe(invoke_stop)
+        assert done.wait(2.0)
+        assert isinstance(captured.get('exc'), RuntimeError)
+        assert str(captured['exc']) == 'socket thread cannot stop itself'
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert loop_thread.is_alive() is False

@@ -90,3 +90,55 @@ def test_eventsub_partial_start_cleanup() -> None:
     assert client.is_running is False
     assert client.is_ready is False
     assert client.wait_closed(0.1) is True
+
+
+def test_eventsub_stop_clears_socket_loop_on_success() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    release = threading.Event()
+    helper_started = threading.Event()
+
+    def socket_helper() -> None:
+        helper_started.set()
+        release.wait(2.0)
+
+    helper = threading.Thread(target=socket_helper)
+    helper.start()
+    assert helper_started.wait(1.0)
+
+    async def short_stop() -> None:
+        release.set()
+
+    client = _new_eventsub(_running=True, _socket_loop=loop, _socket_thread=helper)
+    client._stop = short_stop
+    try:
+        asyncio.run(client.stop(timeout=1.0))
+        assert client._socket_loop is None
+        assert client._socket_thread is None
+        assert client.is_running is False
+    finally:
+        release.set()
+        helper.join(1.0)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert helper.is_alive() is False
+    assert loop_thread.is_alive() is False
+
+
+def test_eventsub_stop_from_socket_thread_raises() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    client = _new_eventsub(_running=True, _socket_loop=loop, _socket_thread=loop_thread)
+    try:
+        future = asyncio.run_coroutine_threadsafe(client.stop(timeout=0.05), loop)
+        with pytest.raises(RuntimeError) as exc_info:
+            future.result(2.0)
+        assert str(exc_info.value) == 'socket thread cannot stop itself'
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(1.0)
+        loop.close()
+    assert loop_thread.is_alive() is False

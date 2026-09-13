@@ -837,6 +837,7 @@ class Chat:
                 # startup failed, make sure we do not leave a half started client behind
                 self.__socket_thread.join()
                 self.__socket_thread = None
+                self.__socket_loop = None
                 self.__running = False
                 self._ready = False
                 raise RuntimeError('Chat socket thread died during startup')
@@ -855,6 +856,8 @@ class Chat:
 
         if not self.__running:
             return
+        if self.__socket_thread is threading.current_thread():
+            raise RuntimeError('socket thread cannot stop itself')
         self.logger.debug('stopping chat...')
         self.__startup_complete = False
         self.__running = False
@@ -873,6 +876,7 @@ class Chat:
             if thread.is_alive():
                 raise TimeoutError('Twitch socket thread did not stop')
         self.__socket_thread = None
+        self.__socket_loop = None
 
     async def _stop(self):
         await self.__connection.close()
