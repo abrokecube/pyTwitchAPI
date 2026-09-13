@@ -569,14 +569,22 @@ class EventSubWebsocket(EventSubBase):
         self._reconnect_timeout = datetime.datetime.now() + datetime.timedelta(seconds=self.active_session.keepalive_timeout_seconds*2)
 
     async def _handle_revocation(self, data: dict):
-        _payload = data.get('payload', {})
-        sub_id: str = _payload.get('subscription', {}).get('id')
-        self.logger.debug(f'got revocation of subscription {sub_id} for reason {_payload.get("subscription").get("status")}')
-        if sub_id not in self._active_subscriptions.keys():
+        _payload = data.get('payload', {}) if isinstance(data, dict) else {}
+        if not isinstance(_payload, dict):
+            _payload = {}
+        subscription = _payload.get('subscription', {})
+        if not isinstance(subscription, dict):
+            subscription = {}
+        sub_id = subscription.get('id')
+        if not isinstance(sub_id, str) or not sub_id:
+            self.logger.warning('got malformed revocation without a valid subscription id. ignore')
+            return
+        self.logger.debug(f'got revocation of subscription {sub_id} for reason {subscription.get("status")}')
+        if sub_id not in self._active_subscriptions:
             self.logger.warning(f'unknown subscription {sub_id} got revoked. ignore')
             return
         self._active_subscriptions.pop(sub_id)
-        self._callbacks.pop(sub_id)
+        self._callbacks.pop(sub_id, None)
         if self.revokation_handler is not None:
             self._dispatch_callback(self.revokation_handler(_payload))
 

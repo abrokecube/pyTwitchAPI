@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import threading
@@ -971,3 +972,215 @@ def test_eventsub_socket_exit_without_closing_reports_failed_and_not_ready() -> 
         socket_loop.run_until_complete(_drain_cancelled(client._tasks))
         socket_loop.close()
         asyncio.set_event_loop(None)
+
+
+# --- keepalive-expiry reconnect handling (real _task_reconnect_handler) ---
+
+class _RecordingWebsocketSession:
+    def __init__(self) -> None:
+        self.calls: list = []
+        self.connection = _FakeConnection()
+
+    async def ws_connect(self, url: str) -> _FakeConnection:
+        self.calls.append(url)
+        return self.connection
+
+
+def _expired_deadline() -> datetime.datetime:
+    return datetime.datetime.now() - datetime.timedelta(seconds=1)
+
+
+def _future_deadline() -> datetime.datetime:
+    return datetime.datetime.now() + datetime.timedelta(seconds=30)
+
+
+def _start_reconnect_watch(session, **attrs):
+    """Build a client whose (real) ``_connect`` is wrapped to record ``is_startup``."""
+    callbacks = attrs.pop('_callbacks', {})
+    active = attrs.pop('_active_subscriptions', {})
+    client = _new_eventsub(
+        _session=session,
+        _callbacks=callbacks,
+        _active_subscriptions=active,
+        _callback_loop=asyncio.get_running_loop(),
+        _reset_timeout=lambda: None,
+        **attrs,
+    )
+    connect_calls: list = []
+    real_connect = client._connect
+
+    async def recording_connect(is_startup: bool = False):
+        connect_calls.append(is_startup)
+        await real_connect(is_startup=is_startup)
+
+    client._connect = recording_connect
+    return client, connect_calls
+
+
+def test_keepalive_future_deadline_does_not_reconnect_early() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, connect_calls = _start_reconnect_watch(session)
+        client._reconnect_timeout = _future_deadline()
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        try:
+            await asyncio.sleep(0.15)
+            assert connect_calls == []
+            assert client.connection_state is not ConnectionState.RECONNECTING
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_expired_deadline_reconnects_with_is_startup_false() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, connect_calls = _start_reconnect_watch(session)
+        client._set_connection_state(ConnectionState.READY)
+        client._reconnect_timeout = _expired_deadline()
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        try:
+            await _wait_until(lambda: len(connect_calls) == 1)
+            assert connect_calls == [False]
+            assert session.calls == ['wss://example.invalid/ws']
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_expired_deadline_exposes_reconnecting_and_not_ready() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, connect_calls = _start_reconnect_watch(session)
+        client._set_connection_state(ConnectionState.READY)
+        assert client.is_ready is True
+        client._reconnect_timeout = _expired_deadline()
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        try:
+            await _wait_for_state(client, ConnectionState.RECONNECTING)
+            assert connect_calls == [False]
+            assert client.is_ready is False
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_reconnect_clears_deadline_and_does_not_storm() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, connect_calls = _start_reconnect_watch(session)
+        client._reconnect_timeout = _expired_deadline()
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        try:
+            await _wait_until(lambda: len(connect_calls) == 1)
+            assert client._reconnect_timeout is None
+            await asyncio.sleep(0.3)
+            assert connect_calls == [False]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_reconnect_handler_exits_cleanly_on_cancel() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, _ = _start_reconnect_watch(session)
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        await asyncio.sleep(0.15)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.done() is True
+        assert task.cancelled() is False
+        assert task.exception() is None
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_reconnect_handler_exits_cleanly_when_stopping() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        client, _ = _start_reconnect_watch(session)
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        await asyncio.sleep(0.15)
+        client._closing = True
+        await asyncio.wait_for(task, timeout=1.0)
+        assert task.done() is True
+        assert task.cancelled() is False
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_reconnect_recovers_subscriptions_and_returns_ready() -> None:
+    async def scenario() -> None:
+        session = _RecordingWebsocketSession()
+        subscription = {
+            'sub_type': 'channel.chat.message',
+            'sub_version': '1',
+            'condition': {'broadcaster_user_id': '1', 'user_id': '2'},
+            'callback': lambda _event: None,
+            'event': lambda **kw: kw,
+        }
+        resubscribed: list = []
+        client, connect_calls = _start_reconnect_watch(
+            session,
+            _active_subscriptions={'sub-1': subscription},
+            _callbacks={'sub-1': {'id': 'sub-1', 'callback': lambda _e: None, 'active': True, 'event': lambda **kw: kw}},
+        )
+        client._set_connection_state(ConnectionState.READY)
+        client._reconnect_timeout = _expired_deadline()
+
+        async def fake_subscribe(sub_type, sub_version, condition, callback, event, is_batching_enabled=None):
+            resubscribed.append(sub_type)
+            client._active_subscriptions['sub-1'] = {
+                'sub_type': sub_type,
+                'sub_version': sub_version,
+                'condition': condition,
+                'callback': callback,
+                'event': event,
+            }
+            return 'sub-1'
+
+        client._subscribe = fake_subscribe
+        task = asyncio.ensure_future(client._task_reconnect_handler())
+        try:
+            await _wait_for_state(client, ConnectionState.RECONNECTING)
+            assert connect_calls == [False]
+            assert client.is_ready is False
+
+            await client._handle_welcome(_welcome('sess-new'))
+            assert client.connection_state is ConnectionState.READY
+            assert client.is_ready is True
+            assert client._is_reconnecting is False
+            assert resubscribed == ['channel.chat.message']
+            assert list(client._active_subscriptions) == ['sub-1']
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_handle_keepalive_resets_reconnect_deadline_to_future() -> None:
+    async def scenario() -> None:
+        client = _new_eventsub(
+            active_session=Session(
+                id='sess-1',
+                keepalive_timeout_seconds=30,
+                status='connected',
+                reconnect_url=None,
+            ),
+        )
+        client._reconnect_timeout = _expired_deadline()
+        await client._handle_keepalive({})
+        assert client._reconnect_timeout is not None
+        assert client._reconnect_timeout > datetime.datetime.now()
+
+    asyncio.run(scenario())
