@@ -237,12 +237,13 @@ class EventSubWebsocket(EventSubBase):
     def _set_connection_state(self, state: ConnectionState) -> None:
         """Record ``state`` and notify the handler synchronously outside the state lock.
 
-        The handler is invoked synchronously, outside the state lock, so it may be called
-        concurrently and out of order from different threads (for example the thread that called
-        :meth:`start`/:meth:`stop` and the socket thread). It must therefore be thread-safe and
-        must not block. If the handler observes a last state other than the one it expected,
-        :attr:`connection_state` is the source of truth. Re-entrant calls (such as :meth:`stop`)
-        are supported; the handler should avoid blocking them rather than refrain from making them.
+        The handler is invoked synchronously, outside the state lock. It may execute on the socket
+        thread, and it may be called concurrently and out of order from different threads (for
+        example the thread that called :meth:`start`/:meth:`stop` and the socket thread). It must
+        therefore be thread-safe and must not block. In particular it must not call the blocking
+        :meth:`stop` or :meth:`wait_closed` from the socket thread: those raise :exc:`RuntimeError`
+        rather than join or stop the socket thread from itself. If the handler observes a last state
+        other than the one it expected, :attr:`connection_state` is the source of truth.
         """
         with self._state_lock:
             if state == self._connection_state:
@@ -406,6 +407,7 @@ class EventSubWebsocket(EventSubBase):
             self.logger.debug(f'connecting to {self.connection_url}...')
         else:
             self._is_reconnecting = True
+            self._ready = False
             self._set_connection_state(ConnectionState.RECONNECTING)
             self.logger.debug(f'reconnecting using {self.connection_url}...')
         self._reconnect_timeout = None
@@ -513,6 +515,7 @@ class EventSubWebsocket(EventSubBase):
                         self._is_reconnecting = False
                         if self._active_subscriptions:
                             await self._resubscribe()
+                        self._ready = True
                         self._set_connection_state(ConnectionState.READY)
                         self.logger.debug("websocket session_reconnect completed")
                         continue
@@ -583,6 +586,7 @@ class EventSubWebsocket(EventSubBase):
         session = data.get('payload', {}).get('session', {})
         new_session = Session.from_twitch(session)
         self.logger.debug(f"got request from websocket to reconnect, reconnect url: {new_session.reconnect_url}")
+        self._ready = False
         self._set_connection_state(ConnectionState.RECONNECTING)
         self._reset_timeout()
         new_connection = None
@@ -632,6 +636,7 @@ class EventSubWebsocket(EventSubBase):
             await self._resubscribe()
         self._is_reconnecting = False
         self._startup_complete = True
+        self._ready = True
         self._set_connection_state(ConnectionState.READY)
 
     async def _handle_keepalive(self, data: dict):

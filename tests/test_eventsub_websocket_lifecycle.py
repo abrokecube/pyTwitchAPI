@@ -835,3 +835,71 @@ def test_eventsub_reconnect_handover_emits_ready_and_dedupes_across_swap() -> No
     ]
 
 
+# --- is_ready projection ---
+
+def test_eventsub_is_ready_starts_false() -> None:
+    client = _new_eventsub()
+    assert client.is_ready is False
+    assert client.connection_state is ConnectionState.STOPPED
+
+
+def test_eventsub_first_welcome_sets_is_ready() -> None:
+    client = _new_eventsub()
+    asyncio.run(client._handle_welcome(_welcome('sess-1')))
+    assert client.connection_state is ConnectionState.READY
+    assert client.is_ready is True
+
+
+def test_eventsub_connect_reconnect_entry_clears_is_ready() -> None:
+    client = _new_eventsub(_ready=True, _session=_FakeWebsocketSession())
+    asyncio.run(client._connect(is_startup=False))
+    assert client.connection_state is ConnectionState.RECONNECTING
+    assert client.is_ready is False
+
+
+def test_eventsub_handle_reconnect_clears_then_handover_sets_is_ready() -> None:
+    async def scenario() -> None:
+        old_connection = _FakeConnection()
+        new_connection = _FakeConnection()
+        client = _new_eventsub(
+            _connection=old_connection,
+            active_session=Session(
+                id='sess-old',
+                keepalive_timeout_seconds=30,
+                status='connected',
+                reconnect_url=None,
+            ),
+            _session=_HandoverSession(new_connection),
+            _callback_loop=asyncio.get_running_loop(),
+            _reset_timeout=lambda: None,
+            _active_subscriptions={},
+            _callbacks={},
+            _running=True,
+            _ready=True,
+        )
+        receive_task = asyncio.ensure_future(client._task_receive())
+        try:
+            old_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_reconnect_request())))
+            await _wait_for_state(client, ConnectionState.RECONNECTING)
+            assert client.is_ready is False
+
+            new_connection.push(_FakeWSMessage(aiohttp.WSMsgType.TEXT, json.dumps(_welcome('sess-new'))))
+            await _wait_for_state(client, ConnectionState.READY)
+            assert client.is_ready is True
+        finally:
+            receive_task.cancel()
+            await asyncio.gather(receive_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_eventsub_stop_and_startup_failure_clear_is_ready() -> None:
+    stopped = _new_eventsub(_ready=True, _running=True, _socket_thread=None, _socket_loop=None)
+    asyncio.run(stopped.stop(timeout=1.0))
+    assert stopped.is_ready is False
+
+    failed = _new_eventsub(_ready=True)
+    failed._run_socket = lambda: None
+    with pytest.raises(RuntimeError):
+        failed.start()
+    assert failed.is_ready is False

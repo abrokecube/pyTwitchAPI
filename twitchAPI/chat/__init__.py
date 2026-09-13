@@ -923,12 +923,13 @@ class Chat:
     def _set_connection_state(self, state: ConnectionState) -> None:
         """Record ``state`` and notify the handler synchronously outside the state lock.
 
-        The handler is invoked synchronously, outside the state lock, so it may be called
-        concurrently and out of order from different threads (for example the thread that called
-        :meth:`start`/:meth:`stop` and the socket thread). It must therefore be thread-safe and
-        must not block. If the handler observes a last state other than the one it expected,
-        :attr:`connection_state` is the source of truth. Re-entrant calls (such as :meth:`stop`)
-        are supported; the handler should avoid blocking them rather than refrain from making them.
+        The handler is invoked synchronously, outside the state lock. It may execute on the socket
+        thread, and it may be called concurrently and out of order from different threads (for
+        example the thread that called :meth:`start`/:meth:`stop` and the socket thread). It must
+        therefore be thread-safe and must not block. In particular it must not call the blocking
+        :meth:`stop` or :meth:`wait_closed` from the socket thread: those raise :exc:`RuntimeError`
+        rather than join or stop the socket thread from itself. If the handler observes a last state
+        other than the one it expected, :attr:`connection_state` is the source of truth.
         """
         with self._state_lock:
             if state == self._connection_state:
@@ -1082,6 +1083,7 @@ class Chat:
             return
 
     async def _handle_base_reconnect(self):
+        self._ready = False
         self._set_connection_state(ConnectionState.RECONNECTING)
         await self.__connect(is_startup=False)
         await self.__task_startup()

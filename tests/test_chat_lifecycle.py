@@ -399,3 +399,35 @@ def test_chat_socket_exit_without_closing_reports_failed() -> None:
         socket_loop.close()
         asyncio.set_event_loop(None)
 
+
+# --- is_ready projection ---
+
+def test_chat_is_ready_starts_false_and_001_sets_ready() -> None:
+    chat = _new_chat()
+    assert chat.is_ready is False
+    asyncio.run(chat._handle_ready({'parameters': None, 'tags': {}}))
+    assert chat.connection_state is ConnectionState.READY
+    assert chat.is_ready is True
+
+
+def test_chat_reconnect_entry_clears_is_ready() -> None:
+    chat = _new_chat()
+    asyncio.run(chat._handle_ready({'parameters': None, 'tags': {}}))
+    assert chat.is_ready is True
+    chat._Chat__connect = _noop
+    chat._Chat__task_startup = _noop
+    asyncio.run(chat._handle_base_reconnect())
+    assert chat.connection_state is ConnectionState.RECONNECTING
+    assert chat.is_ready is False
+
+
+def test_chat_reconnect_handover_restores_is_ready() -> None:
+    chat = _new_chat()
+    asyncio.run(chat._handle_ready({'parameters': None, 'tags': {}}))
+    chat._Chat__connect = _noop
+    chat._Chat__task_startup = _noop
+    asyncio.run(chat._handle_base_reconnect())
+    assert chat.is_ready is False
+    asyncio.run(chat._handle_ready({'parameters': None, 'tags': {}}))
+    assert chat.connection_state is ConnectionState.READY
+    assert chat.is_ready is True
