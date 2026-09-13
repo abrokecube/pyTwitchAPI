@@ -219,6 +219,7 @@ Class Documentation
 *******************
 """
 import asyncio
+import concurrent.futures
 import dataclasses
 import datetime
 import re
@@ -863,7 +864,7 @@ class Chat:
             f = asyncio.run_coroutine_threadsafe(self._stop(), self.__socket_loop)
             try:
                 f.result(timeout=_remaining_timeout(deadline))
-            except TimeoutError:
+            except concurrent.futures.TimeoutError:
                 f.cancel()
                 raise TimeoutError('Twitch socket thread did not stop')
         thread = self.__socket_thread

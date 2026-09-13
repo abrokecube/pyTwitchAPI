@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 
@@ -85,3 +86,38 @@ def test_chat_partial_start_cleanup() -> None:
     assert chat.is_running is False
     assert chat.is_ready is False
     assert chat.wait_closed(0.1) is True
+
+
+def test_chat_stop_bounds_socket_stop_future() -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    try:
+        async def never_ending_stop() -> None:
+            await asyncio.Event().wait()
+
+        chat = _new_chat(_Chat__running=True, _Chat__socket_loop=loop, _Chat__socket_thread=None)
+        chat._stop = never_ending_stop
+        with pytest.raises(TimeoutError) as exc_info:
+            chat.stop(timeout=0.01)
+        assert type(exc_info.value) is TimeoutError
+        assert str(exc_info.value) == 'Twitch socket thread did not stop'
+        assert chat.is_running is False
+        assert chat.is_ready is False
+    finally:
+        async def cancel_pending() -> None:
+            current = asyncio.current_task()
+            pending = [task for task in asyncio.all_tasks() if task is not current]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        shutdown = asyncio.run_coroutine_threadsafe(cancel_pending(), loop)
+        try:
+            shutdown.result(1.0)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(1.0)
+            loop.close()
+    assert loop_thread.is_alive() is False

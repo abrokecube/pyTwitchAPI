@@ -78,6 +78,7 @@ Code Example
     asyncio.run(run())
 """
 import asyncio
+import concurrent.futures
 import datetime
 import json
 import threading
@@ -253,7 +254,7 @@ class EventSubWebsocket(EventSubBase):
             f = asyncio.run_coroutine_threadsafe(self._stop(), self._socket_loop)
             try:
                 f.result(timeout=_remaining_timeout(deadline))
-            except TimeoutError:
+            except concurrent.futures.TimeoutError:
                 f.cancel()
                 raise TimeoutError('Twitch socket thread did not stop')
         thread = self._socket_thread
